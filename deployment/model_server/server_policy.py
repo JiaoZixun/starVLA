@@ -72,6 +72,13 @@ def main(args) -> None:
         port=args.port,
         idle_timeout=args.idle_timeout,
         metadata=metadata,
+        max_inference_batch_size=args.max_inference_batch_size,
+        inference_batch_wait_ms=args.inference_batch_wait_ms,
+    )
+    logging.info(
+        "Inference batching: max batch size=%d, collection window=%.1f ms",
+        args.max_inference_batch_size,
+        args.inference_batch_wait_ms,
     )
     logging.info("server running ... metadata=%s", metadata)
     server.serve_forever()
@@ -84,6 +91,18 @@ def build_argparser():
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--seed", type=int, default=None, help="Seed Python, NumPy, and PyTorch before loading the policy")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument(
+        "--max_inference_batch_size",
+        type=int,
+        default=1,
+        help="Maximum requests combined per model call; 1 disables dynamic batching.",
+    )
+    parser.add_argument(
+        "--inference_batch_wait_ms",
+        type=float,
+        default=10.0,
+        help="Maximum time to collect concurrent inference requests for a batch.",
+    )
     parser.add_argument(
         "--config_override",
         action="append",

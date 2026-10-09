@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 STARVLA_PYTHON="${STARVLA_PYTHON:-python}"
 CKPT="${CKPT:-${STARVLA_DIR}/playground/Checkpoints/libero_example/checkpoints/steps_50000_pytorch_model.pt}"
 GPU_ID="${GPU_ID:-0}"
 PORT="${PORT:-6694}"
 USE_BF16="${USE_BF16:-1}"
+SKIP_BASE_VLM_WEIGHTS="${SKIP_BASE_VLM_WEIGHTS:-0}"
 
 cd "${STARVLA_DIR}"
 export PYTHONPATH="${STARVLA_DIR}:${PYTHONPATH:-}"
@@ -19,6 +20,13 @@ CMD=(
 
 if [[ "${USE_BF16}" == "1" ]]; then
   CMD+=(--use_bf16)
+fi
+
+if [[ "${SKIP_BASE_VLM_WEIGHTS}" == "1" ]]; then
+  CMD+=(
+    --config_override "framework.qwenvl.base_vlm=Qwen/Qwen3-VL-4B-Instruct"
+    --config_override "framework.qwenvl.load_base_weights=false"
+  )
 fi
 
 if [[ -n "${USE_CANONICAL_FORWARD:-}" ]]; then

@@ -58,6 +58,8 @@ class _QWen3_5_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        revision = qwenvl_config.get("revision")
+        hub_kwargs = {"revision": revision} if revision else {}
 
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
@@ -69,9 +71,16 @@ class _QWen3_5_VL_Interface(nn.Module):
             model_id,
             attn_implementation=attn_implementation,
             torch_dtype=torch.bfloat16,
+            **hub_kwargs,
         )
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, **hub_kwargs)
         processor.tokenizer.padding_side = "left"
+
+        if qwenvl_config.get("gradient_checkpointing", False):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.config.use_cache = False
 
         self.model = model
         self.processor = processor

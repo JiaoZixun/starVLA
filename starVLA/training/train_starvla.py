@@ -31,7 +31,10 @@ try:
 except ImportError:
     pass
 
-import wandb
+try:
+    import wandb
+except ImportError:  # Weights & Biases is an optional logging integration.
+    wandb = None
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed

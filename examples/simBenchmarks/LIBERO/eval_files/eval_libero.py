@@ -41,6 +41,8 @@ class Args:
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     max_tasks: int = -1  # If > 0, limit the number of tasks evaluated (smoke / quick check). -1 = run all.
+    task_id_start: int = 0  # Inclusive task ID; used to shard suites across parallel processes.
+    task_id_end: int = -1  # Exclusive task ID; -1 means all available tasks.
 
     #################################################################################################################
     # Utils
@@ -94,13 +96,35 @@ def eval_libero(args: Args) -> None:
         unnorm_key=args.unnorm_key,
     )
 
-    # Optional smoke-test cap (still useful for quick verification with -1 = full run).
-    n_eval_tasks = num_tasks_in_suite if args.max_tasks <= 0 else min(args.max_tasks, num_tasks_in_suite)
-    logging.info(f"Evaluating {n_eval_tasks} of {num_tasks_in_suite} tasks (max_tasks={args.max_tasks})")
+    # Optional smoke-test cap and half-open task range for parallel sharding.
+    n_available_tasks = num_tasks_in_suite if args.max_tasks <= 0 else min(args.max_tasks, num_tasks_in_suite)
+    task_start = max(0, args.task_id_start)
+    task_end = n_available_tasks if args.task_id_end < 0 else min(args.task_id_end, n_available_tasks)
+    if task_start >= task_end:
+        raise ValueError(
+            f"Empty task range [{task_start}, {task_end}) for {args.task_suite_name} "
+            f"with {n_available_tasks} available tasks"
+        )
+    task_ids = range(task_start, task_end)
+    save_videos = os.getenv("SAVE_VIDEOS", "1").lower() not in {"0", "false", "no", "off"}
+    max_videos_per_outcome = int(os.getenv("MAX_VIDEOS_PER_OUTCOME", "1"))
+    if max_videos_per_outcome < 1:
+        raise ValueError("MAX_VIDEOS_PER_OUTCOME must be >= 1")
+    logging.info(
+        "Evaluating task IDs [%d, %d) of %d (max_tasks=%d, save_videos=%s, "
+        "max_videos_per_outcome=%d)",
+        task_start,
+        task_end,
+        num_tasks_in_suite,
+        args.max_tasks,
+        save_videos,
+        max_videos_per_outcome,
+    )
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(n_eval_tasks)):
+    task_results = []
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -112,6 +136,7 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        saved_task_videos = {"success": 0, "failure": 0}
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -124,7 +149,10 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
-            replay_images = []
+            needs_more_task_videos = save_videos and any(
+                count < max_videos_per_outcome for count in saved_task_videos.values()
+            )
+            replay_images = [] if needs_more_task_videos else None
             full_actions = []
 
             logging.info(f"Starting episode {task_episodes + 1}...")
@@ -146,7 +174,8 @@ def eval_libero(args: Args) -> None:
                 wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
 
                 # Save preprocessed image for replay video
-                replay_images.append(img)
+                if replay_images is not None:
+                    replay_images.append(img)
 
                 state = np.concatenate(
                     (
@@ -215,11 +244,19 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            if replay_images is not None and saved_task_videos[suffix] < max_videos_per_outcome:
+                video_number = saved_task_videos[suffix] + 1
+                video_name = (
+                    f"rollout_{task_segment}_{suffix}.mp4"
+                    if max_videos_per_outcome == 1
+                    else f"rollout_{task_segment}_{suffix}_{video_number:02d}.mp4"
+                )
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path) / video_name,
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
+                saved_task_videos[suffix] += 1
 
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
@@ -231,10 +268,33 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
         # Log final results
-        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        task_success_rate = float(task_successes) / float(task_episodes)
+        task_results.append(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "episodes": task_episodes,
+                "successes": task_successes,
+                "success_rate": task_success_rate,
+            }
+        )
+        logging.info(f"Current task success rate: {task_success_rate}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    success_rate = float(total_successes) / float(total_episodes)
+    summary = {
+        "task_suite": args.task_suite_name,
+        "seed": args.seed,
+        "episodes": total_episodes,
+        "successes": total_successes,
+        "success_rate": success_rate,
+        "task_results": task_results,
+    }
+    with open(pathlib.Path(args.video_out_path) / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+        f.write("\n")
+
+    logging.info(f"Total success rate: {success_rate}")
     logging.info(f"Total episodes: {total_episodes}")
 
 
