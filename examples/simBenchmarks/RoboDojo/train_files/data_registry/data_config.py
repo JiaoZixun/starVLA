@@ -95,4 +95,7 @@ DATASET_NAMED_MIXTURES = {
     "robodojo_v21_all_h50_q99": [
         ("RoboDojo_lerobot_v21_video", 1.0, _ROBOT_TYPE),
     ],
+    "robodojo_v30_all_h50_q99": [
+        ("RoboDojo_lerobot_v30_video", 1.0, _ROBOT_TYPE),
+    ],
 }

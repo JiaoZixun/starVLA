@@ -952,7 +952,6 @@ class LeRobotSingleDataset(Dataset):
                                 "chunk_index": int(episode[chunk_col]),
                                 "file_index": int(episode[file_col]),
                             }
-                    print(video_file_indices)
                     episode_meta = {
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],

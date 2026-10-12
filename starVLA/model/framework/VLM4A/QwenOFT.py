@@ -289,7 +289,11 @@ class Qwenvl_OFT(baseframework):
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        # CPU NumPy does not support torch.bfloat16 tensors.  The deployment
+        # server runs the full framework in BF16, so convert the small action
+        # chunk to float32 before handing it to the normalization/websocket
+        # path.
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
     def _gather_action_token_embeddings(

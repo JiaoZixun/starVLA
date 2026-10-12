@@ -80,6 +80,11 @@ class _QWen3_5_VL_Interface(nn.Module):
         # alin qwen3.5 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
 
+        if config.get("trainer", {}).get("gradient_checkpointing", False):
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            logger.info("Qwen3.5 gradient checkpointing enabled")
+        logger.info(f"Loaded VLM backbone: {model_id}, hidden_size={self.model.config.hidden_size}")
+
         # only for fast base model
         if "-Action" in model_id:
             self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
@@ -92,6 +97,11 @@ class _QWen3_5_VL_Interface(nn.Module):
         """
         Forward pass delegating to underlying Qwen3.5-VL backbone.
         """
+
+        if self.training and self.config.framework.name == "QwenOFT" and kwargs.get("labels") is None:
+            # OFT uses hidden states; full vocabulary logits and KV caches are unused.
+            kwargs.setdefault("logits_to_keep", 1)
+            kwargs.setdefault("use_cache", False)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.model(

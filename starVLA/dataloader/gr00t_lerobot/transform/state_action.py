@@ -18,7 +18,10 @@ import random
 from typing import Any, ClassVar
 
 import numpy as np
-import pytorch3d.transforms as pt
+try:
+    import pytorch3d.transforms as pt
+except ImportError:  # Rotation transforms are optional for joint/state-only datasets.
+    pt = None
 import torch
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
@@ -37,6 +40,11 @@ class RotationTransform:
 
         Always use matrix as intermediate representation.
         """
+        if pt is None:
+            raise ImportError(
+                "pytorch3d is required when RotationTransform is used; "
+                "joint/state-only datasets do not need this optional dependency."
+            )
         if from_rep.startswith("euler_angles"):
             from_convention = from_rep.split("_")[-1]
             from_rep = "euler_angles"
@@ -414,7 +422,7 @@ class StateActionTransform(InvertibleModalityTransform):
             ), f"{state_key} statistics not found"
             assert (
                 len(getattr(modality_metadata, modality)[state_key].shape) == 1
-            ), f"{getattr(modality_metadata, modality)[state_key].shape=}"
+            ), f"Unexpected shape for {modality}.{state_key}: {getattr(modality_metadata, modality)[state_key].shape}"
             self.normalization_statistics[key] = getattr(dataset_statistics, modality)[
                 state_key
             ].model_dump()
