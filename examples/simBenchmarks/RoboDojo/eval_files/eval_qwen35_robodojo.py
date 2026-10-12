@@ -26,6 +26,13 @@ DEFAULT_BASE = Path(
     "snapshots/2fc06364715b967f1860aea9cf38778875588b17"
 )
 CHECKPOINT_LABEL = "qwen35_0p8b_oft"
+LATENCY_SAMPLE_TASKS = (
+    "stack_bowls",
+    "match_and_pick_from_conveyor",
+    "insert_tubes",
+    "fill_pen_holder",
+    "general_pickup",
+)
 
 
 def read_result(path: Path) -> dict:
@@ -52,6 +59,11 @@ def stop_process(process: subprocess.Popen | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", nargs="+", help="Default: all 42 official RoboDojo tasks")
+    parser.add_argument(
+        "--latency-tasks",
+        nargs="+",
+        help="Tasks to record inference latency for (default: one representative per suite)",
+    )
     parser.add_argument("--episodes", type=int, default=int(os.environ.get("EPISODES", "10")))
     parser.add_argument("--num-envs", type=int, default=int(os.environ.get("NUM_ENVS", "5")))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("LAYOUT_SEED", "0")))
@@ -60,6 +72,10 @@ def main() -> None:
     parser.add_argument("--base-model", type=Path, default=Path(os.environ.get("QWEN35_BASE", DEFAULT_BASE)))
     parser.add_argument("--output", type=Path, help="Reuse this directory to resume")
     parser.add_argument("--check-only", action="store_true", help="Run validation and strict load only")
+    parser.add_argument("--checkpoint-label", default=CHECKPOINT_LABEL,
+                        help="Result-directory checkpoint label; legacy default is unchanged")
+    parser.add_argument("--expected-parameters", type=int, default=863520846,
+                        help="Expected parameter count for preflight; use 0 to skip")
     args = parser.parse_args()
     if args.episodes < 1 or args.num_envs < 1 or args.seed < 0 or args.gpu < 0:
         parser.error("episodes/num-envs must be positive; seed/GPU must be nonnegative")
@@ -92,6 +108,9 @@ def main() -> None:
     tasks = args.tasks or official
     if len(tasks) != len(set(tasks)) or any(task not in official for task in tasks):
         parser.error("--tasks must contain unique official task names")
+    latency_tasks = tuple(args.latency_tasks or LATENCY_SAMPLE_TASKS)
+    if len(latency_tasks) != len(set(latency_tasks)) or any(task not in official for task in latency_tasks):
+        parser.error("--latency-tasks must contain unique official task names")
     try:
         num_envs_overrides = {
             str(task): int(value)
@@ -153,11 +172,12 @@ from starVLA.model.framework.base_framework import baseframework, _auto_import_f
 _auto_import_framework_modules()
 model = baseframework.from_pretrained(sys.argv[1])
 count = sum(p.numel() for p in model.parameters())
-assert count == 863520846, f'unexpected parameter count: {count}'
+    expected = int(sys.argv[2])
+    assert expected == 0 or count == expected, f'unexpected parameter count: {count}, expected {expected}'
 print(f'Strict checkpoint load OK: {count:,} parameters')
 """
     subprocess.run(
-        [str(policy_env / "bin/python"), "-c", load_check, str(checkpoint)],
+        [str(policy_env / "bin/python"), "-c", load_check, str(checkpoint), str(args.expected_parameters)],
         cwd=source,
         env=env,
         check=True,
@@ -177,7 +197,7 @@ print(f'Strict checkpoint load OK: {count:,} parameters')
         checkpoint_bytes=checkpoint.stat().st_size,
         base_vlm="Qwen/Qwen3.5-0.8B",
         base_model_path=str(base_model),
-        base_parameters=863520846,
+        base_parameters=int(args.expected_parameters) if args.expected_parameters else count,
         benchmark=str(bench),
         policy_python=str(policy_env / "bin/python"),
         simulator=str(sim_env),
@@ -190,7 +210,11 @@ print(f'Strict checkpoint load OK: {count:,} parameters')
             raise ValueError("Resume settings differ from manifest.json; use a new --output")
     else:
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    env["STARVLA_INFERENCE_LATENCY_LOG"] = str(output / "inference_latency.jsonl")
+    env["STARVLA_INFERENCE_LATENCY_TASKS"] = ",".join(latency_tasks)
+    env["STARVLA_INFERENCE_LATENCY_MODEL"] = "qwen35_0p8b_oft"
     print(f"Output: {output}\nTasks: {len(tasks)}, layouts/task: {args.episodes}, parallel envs: {args.num_envs}", flush=True)
+    print(f"Recording action-chunk inference latency for: {', '.join(latency_tasks)}", flush=True)
     if args.check_only:
         print("Preflight passed. No simulation started.")
         return
@@ -214,7 +238,7 @@ print(f'Strict checkpoint load OK: {count:,} parameters')
                 run_id = f"{manifest['run_id']}-{task}"
                 result_path = (
                     bench / "eval_result/RoboDojo" / task / "starVLA/arx_x5" /
-                    f"{args.seed}_ckpt_name={CHECKPOINT_LABEL},action_type=joint" / run_id / "_result.json"
+                    f"{args.seed}_ckpt_name={args.checkpoint_label},action_type=joint" / run_id / "_result.json"
                 )
                 log_path = output / f"{task}.log"
                 data = read_result(result_path)
@@ -228,7 +252,7 @@ print(f'Strict checkpoint load OK: {count:,} parameters')
                     )
                     command = [
                         "bash", str(Path(__file__).with_name("run_qwen35_robodojo_eval.sh")),
-                        "RoboDojo", task, CHECKPOINT_LABEL, "arx_x5", "joint", str(args.seed),
+                        "RoboDojo", task, args.checkpoint_label, "arx_x5", "joint", str(args.seed),
                         str(args.gpu), str(args.gpu), str(policy_env), str(sim_env),
                     ]
                     progress.set_description(task)

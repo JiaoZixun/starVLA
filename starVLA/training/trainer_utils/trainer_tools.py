@@ -296,6 +296,17 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
+                model_keys = set(model.state_dict().keys())
+                checkpoint_keys = set(checkpoint.keys())
+                missing = model_keys - checkpoint_keys
+                unexpected = checkpoint_keys - model_keys
+                allowed = tuple(getattr(model, "allow_missing_checkpoint_prefixes", ()))
+                bad_missing = [k for k in missing if not any(k.startswith(prefix) for prefix in allowed)]
+                if unexpected or bad_missing:
+                    raise RuntimeError(
+                        "Checkpoint/model key mismatch: "
+                        f"unexpected={sorted(unexpected)[:8]}, missing={sorted(bad_missing)[:8]}"
+                    )
                 model.load_state_dict(checkpoint, strict=False)
                 if _dist_rank() == 0:
                     print("✅ loaded <full_model> model parameters")

@@ -420,7 +420,9 @@ class VLATrainer(TrainerUtils):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                # Spatial frameworks expose auxiliary losses through total_loss;
+                # legacy frameworks continue to train from action_loss.
+                total_loss = output_dict.get("total_loss", action_loss)
 
             self.accelerator.backward(total_loss)
 
@@ -438,6 +440,11 @@ class VLATrainer(TrainerUtils):
 
         return {
             "action_dit_loss": action_loss.item(),
+            **{
+                key: value.item()
+                for key, value in output_dict.items()
+                if key not in {"action_loss", "total_loss"} and isinstance(value, torch.Tensor)
+            },
         }
 
     def _finalize_training(self):

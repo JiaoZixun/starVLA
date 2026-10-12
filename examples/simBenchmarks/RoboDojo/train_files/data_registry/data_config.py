@@ -84,6 +84,12 @@ class RoboDojoArxX5H50Q99DataConfig:
             ]
         )
 
+    def make_dataset(self, **kwargs):
+        # Keep the stock loader and its mixture semantics; geometry is an
+        # optional hook inside LeRobotSingleDataset and is disabled by default.
+        from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
+        return LeRobotSingleDataset(**{k: v for k, v in kwargs.items() if k != "dataset_name"})
+
 
 _ROBOT_TYPE = "robodojo_arx_x5_h50_q99"
 

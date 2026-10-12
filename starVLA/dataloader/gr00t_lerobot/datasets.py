@@ -636,6 +636,15 @@ class LeRobotSingleDataset(Dataset):
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
+        # Optional FastVLA geometry sidecar.  It is deliberately loaded lazily
+        # per episode so worker memory stays bounded and legacy datasets incur
+        # zero overhead when the option is absent.
+        self._spatial_sidecar_dir = None
+        self._spatial_episode_cache = {}
+        if self.data_cfg is not None and self.data_cfg.get("spatial_sidecar_dir", None):
+            self._spatial_sidecar_dir = Path(self.data_cfg.get("spatial_sidecar_dir"))
+            if not (self._spatial_sidecar_dir / "manifest.json").exists():
+                raise FileNotFoundError(f"Spatial sidecar manifest missing: {self._spatial_sidecar_dir / 'manifest.json'}")
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -1371,9 +1380,40 @@ class LeRobotSingleDataset(Dataset):
             dict: The data for the step.
         """
         trajectory_id, base_index = self.all_steps[index]
+        self._spatial_current = (trajectory_id, base_index)
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
         return self._pack_sample(data)
+
+    def _get_spatial_geometry(self, trajectory_id, base_index):
+        if self._spatial_sidecar_dir is None:
+            return None
+        eid = int(trajectory_id)
+        if eid not in self._spatial_episode_cache:
+            manifest = getattr(self, "_spatial_manifest", None)
+            if manifest is None:
+                self._spatial_manifest = json.loads((self._spatial_sidecar_dir / "manifest.json").read_text())
+                manifest = self._spatial_manifest
+            entry = manifest["episodes"].get(str(eid))
+            if entry is None:
+                raise KeyError(f"Episode {eid} is absent from spatial sidecar")
+            self._spatial_episode_cache[eid] = np.load(self._spatial_sidecar_dir / entry["file"], allow_pickle=False)
+        z = self._spatial_episode_cache[eid]
+        pose = np.asarray(z["pose"], dtype=np.float32)
+        frame = np.asarray(z["source_frame_index"], dtype=np.int64)
+        if base_index >= len(pose) or int(frame[base_index]) != int(self.curr_traj_data.iloc[base_index]["frame_index"]):
+            raise ValueError(f"Spatial sidecar frame mismatch for episode={eid}, index={base_index}")
+        tau = self.data_cfg.get("spatial_tau", [1, 8, 16, 32, 50])
+        current = pose[base_index]
+        future = np.tile(np.eye(4, dtype=np.float32), (2, len(tau), 1, 1))
+        valid = np.zeros((2, len(tau)), dtype=bool)
+        for k, delta in enumerate(tau):
+            idx = int(base_index) + int(delta)
+            if idx < len(pose) and int(frame[idx]) == int(frame[base_index]) + int(delta):
+                future[:, k] = pose[idx]
+                valid[:, k] = True
+        return {"current_pose": current, "future_pose": future, "future_valid": valid,
+                "source_frame_index": np.int64(frame[base_index]), "arm_mask": np.asarray(z["arm_mask"], dtype=bool)}
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
@@ -1431,6 +1471,9 @@ class LeRobotSingleDataset(Dataset):
             else:
                 state = np.concatenate(state, axis=1).astype(state_action_dtype)
                 sample["state"] = state
+
+        if getattr(self, "_spatial_sidecar_dir", None) is not None and hasattr(self, "_spatial_current"):
+            sample["geometry"] = self._get_spatial_geometry(*self._spatial_current)
 
         return sample
 
@@ -2454,6 +2497,7 @@ class LeRobotMixtureDataset(Dataset):
                     
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
+                dataset._spatial_current = (trajectory_id, step)
                 sample = dataset._pack_sample(data)
                 
                 return sample
