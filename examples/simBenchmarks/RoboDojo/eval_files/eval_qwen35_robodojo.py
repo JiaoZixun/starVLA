@@ -197,7 +197,7 @@ print(f'Strict checkpoint load OK: {count:,} parameters')
         checkpoint_bytes=checkpoint.stat().st_size,
         base_vlm="Qwen/Qwen3.5-0.8B",
         base_model_path=str(base_model),
-        base_parameters=int(args.expected_parameters) if args.expected_parameters else count,
+        base_parameters=int(args.expected_parameters) if args.expected_parameters else 866699351,
         benchmark=str(bench),
         policy_python=str(policy_env / "bin/python"),
         simulator=str(sim_env),
