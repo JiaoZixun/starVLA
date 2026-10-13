@@ -17,6 +17,43 @@ def has_flash_attn():
         return False
 
 
+def get_training_dtype():
+    """Choose a mixed-precision dtype supported by the active GPU.
+
+    Ampere and newer GPUs (including A800) use BF16. Volta GPUs such as the
+    V100 use FP16 because they do not implement BF16 arithmetic. Set
+    ``STARVLA_TRAIN_DTYPE`` to ``bf16``, ``fp16`` or ``fp32`` to override the
+    automatic choice.
+    """
+    import os
+    import torch
+
+    override = os.environ.get("STARVLA_TRAIN_DTYPE", "auto").lower()
+    supported = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if override != "auto":
+        if override not in supported:
+            raise ValueError("STARVLA_TRAIN_DTYPE must be auto, bf16, fp16 or fp32")
+        if override in {"bf16", "bfloat16"} and torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+            if major < 8:
+                raise RuntimeError(
+                    f"BF16 was requested, but GPU compute capability {major}.x is below Ampere (8.0)"
+                )
+        return supported[override]
+
+    if not torch.cuda.is_available():
+        return torch.float32
+    major, _ = torch.cuda.get_device_capability()
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
 def auto_get_module_keys(module, max_depth=0, prefix_list=None, current_depth=0, current_prefix=""):
     """
     get all submodule keys of a module, support setting recursion depth and prefix list.

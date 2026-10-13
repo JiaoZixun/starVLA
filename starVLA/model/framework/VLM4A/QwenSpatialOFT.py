@@ -17,7 +17,7 @@ from PIL import Image
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.framework.VLM4A.QwenOFT import Qwenvl_OFT, masked_l1_loss
 from starVLA.model.framework.share_tools import merge_framework_config
-from starVLA.model.tools import FRAMEWORK_REGISTRY
+from starVLA.model.tools import FRAMEWORK_REGISTRY, get_training_dtype
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.MLP_ActionHeader import get_action_model
 from starVLA.training.trainer_utils.trainer_tools import resize_images
@@ -115,7 +115,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{self.action_token * self.chunk_len}<action>."
         qin = self.qwen_vl_interface.build_qwenvl_inputs(images=images,
                                                           instructions=[x + suffix for x in instructions])
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=get_training_dtype()):
             out = self.qwen_vl_interface(**qin, output_attentions=False,
                                          output_hidden_states=True, return_dict=True)
             hidden = out.hidden_states[-1]
@@ -166,10 +166,11 @@ class QwenSpatialOFT(Qwenvl_OFT):
 
     def forward(self, examples: List[dict] = None, **kwargs):
         _, hidden, ah = self._inputs_and_hidden(examples, inference=False)
-        adapted, wp_loss, rel_loss, geom_loss = self._spatial_forward(hidden, ah, examples)
-        with torch.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", dtype=get_training_dtype()):
+            adapted, wp_loss, rel_loss, geom_loss = self._spatial_forward(hidden, ah, examples)
             pred = self.action_model.predict_action(adapted)
-            targets = torch.as_tensor(np.asarray([e["action"] for e in examples]), device=pred.device, dtype=pred.dtype)[:, -self.action_horizon:]
+            targets = torch.as_tensor(np.asarray([e["action"] for e in examples]), device=pred.device, dtype=torch.float32)[:, -self.action_horizon:]
+            pred = pred.float()
             masks = [e.get("action_mask") for e in examples]
             mask = None if all(x is None for x in masks) else torch.as_tensor(np.asarray(masks), device=pred.device, dtype=torch.bool)[:, -self.action_horizon:]
             bc_loss = masked_l1_loss(pred, targets, mask)
@@ -182,6 +183,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
     def predict_action(self, examples: List[dict] = None, **kwargs):
         if not isinstance(examples, list): examples = [examples]
         _, hidden, ah = self._inputs_and_hidden(examples, inference=True)
-        adapted, _, _, _ = self._spatial_forward(hidden, ah, examples)
-        with torch.autocast("cuda", dtype=torch.float32): pred = self.action_model.predict_action(adapted)
+        with torch.autocast("cuda", dtype=get_training_dtype()):
+            adapted, _, _, _ = self._spatial_forward(hidden, ah, examples)
+            pred = self.action_model.predict_action(adapted)
         return {"normalized_actions": pred.detach().float().cpu().numpy()}

@@ -44,12 +44,38 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
+from starVLA.model.tools import get_training_dtype
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
-deepspeed_plugin = None if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1" else DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
+def create_accelerator(cfg):
+    """Create Accelerate from the merged config, honoring an explicit env override."""
+    configured_steps = int(cfg.trainer.get("gradient_accumulation_steps", 1))
+    env_steps = os.environ.get("STARVLA_GRADIENT_ACCUMULATION_STEPS")
+    gradient_accumulation_steps = int(env_steps) if env_steps is not None else configured_steps
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+
+    # Keep the saved config, reported batch size, and Accelerator runtime in sync.
+    cfg.trainer.gradient_accumulation_steps = gradient_accumulation_steps
+    deepspeed_plugin = None if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1" else DeepSpeedPlugin()
+    training_dtype = get_training_dtype()
+    accelerator_mixed_precision = {
+        torch.bfloat16: "bf16",
+        torch.float16: "fp16",
+        torch.float32: "no",
+    }[training_dtype]
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=accelerator_mixed_precision,
+    )
+    accelerator.print(accelerator.state)
+    accelerator.print(
+        f"Training dtype: {training_dtype}; Accelerator mixed precision: {accelerator_mixed_precision}; "
+        f"gradient accumulation steps: {gradient_accumulation_steps}"
+    )
+    return accelerator
 
 
 def _unwrap_model(accelerator, model):
@@ -310,7 +336,8 @@ class VLATrainer(TrainerUtils):
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
                 metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+            steps_per_epoch = len(self.vla_train_dataloader) / self.accelerator.gradient_accumulation_steps
+            metrics["epoch"] = round(self.completed_steps / steps_per_epoch, 2) if steps_per_epoch else 0.0
             if getattr(self, "_wandb_enabled", False):
                 try:
                     wandb.log(metrics, step=self.completed_steps)
@@ -368,15 +395,16 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            if self.accelerator.sync_gradients:
+                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+                step_metrics["timing/data"] = t_end_data - t_start_data
+                step_metrics["timing/model"] = t_end_model - t_start_model
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+                    self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
@@ -415,9 +443,7 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast("cuda", dtype=get_training_dtype()):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
                 # Spatial frameworks expose auxiliary losses through total_loss;
@@ -426,10 +452,15 @@ class VLATrainer(TrainerUtils):
 
             self.accelerator.backward(total_loss)
 
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
+            # AcceleratedOptimizer skips zero_grad during accumulation and
+            # executes it only when sync_gradients is true. Clear after that
+            # optimizer update so the final micro-step does not erase the
+            # gradients accumulated by the preceding micro-steps.
+            self.optimizer.zero_grad()
             # Only step the LR scheduler when gradients are actually synced
             # (i.e., not mid-accumulation). Without this guard the scheduler
             # runs gradient_accumulation_steps times faster than intended,
@@ -474,6 +505,8 @@ class VLATrainer(TrainerUtils):
 
 
 def main(cfg) -> None:
+    accelerator = create_accelerator(cfg)
+    # Accelerate's logger requires its shared state to be initialized first.
     logger.info("VLA Training :: Warming Up")
 
     cfg = wrap_config(cfg)

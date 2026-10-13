@@ -6,7 +6,7 @@
 from typing import Optional
 
 import torch
-from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
+from starVLA.model.tools import get_training_dtype, has_flash_attn  # unified attention/precision helpers
 from starVLA.training.trainer_utils import initialize_overwatch
 from transformers import AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -68,7 +68,11 @@ class _QWen3_5_VL_Interface(nn.Module):
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_id,
             attn_implementation=attn_implementation,
-            torch_dtype=torch.bfloat16,
+            # Keep optimizer parameters in FP32. ``get_training_dtype`` is the
+            # autocast compute dtype (BF16 on Ampere+, FP16 on Volta); loading
+            # the trainable weights directly as FP16 makes GradScaler reject
+            # their gradients during unscale/gradient clipping.
+            torch_dtype=torch.float32,
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
@@ -103,7 +107,7 @@ class _QWen3_5_VL_Interface(nn.Module):
             kwargs.setdefault("logits_to_keep", 1)
             kwargs.setdefault("use_cache", False)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=get_training_dtype()):
             outputs = self.model(
                 **kwargs,
             )
@@ -122,7 +126,7 @@ class _QWen3_5_VL_Interface(nn.Module):
         Returns:
             GenerateOutput | Model-dependent generation return.
         """
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=get_training_dtype()):
             generation_output = self.model.generate(
                 **kwargs,
             )
