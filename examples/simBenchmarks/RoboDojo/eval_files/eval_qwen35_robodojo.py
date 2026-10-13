@@ -172,8 +172,8 @@ from starVLA.model.framework.base_framework import baseframework, _auto_import_f
 _auto_import_framework_modules()
 model = baseframework.from_pretrained(sys.argv[1])
 count = sum(p.numel() for p in model.parameters())
-    expected = int(sys.argv[2])
-    assert expected == 0 or count == expected, f'unexpected parameter count: {count}, expected {expected}'
+expected = int(sys.argv[2])
+assert expected == 0 or count == expected, f'unexpected parameter count: {count}, expected {expected}'
 print(f'Strict checkpoint load OK: {count:,} parameters')
 """
     subprocess.run(
