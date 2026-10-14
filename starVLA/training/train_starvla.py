@@ -442,6 +442,8 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=get_training_dtype()):
                 output_dict = self.model.forward(batch_vla)
@@ -469,7 +471,7 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
+        metrics = {
             "action_dit_loss": action_loss.item(),
             **{
                 key: value.item()
@@ -477,6 +479,18 @@ class VLATrainer(TrainerUtils):
                 if key not in {"action_loss", "total_loss"} and isinstance(value, torch.Tensor)
             },
         }
+        del output_dict, action_loss, total_loss
+        if torch.cuda.is_available() and self.accelerator.sync_gradients:
+            # These are per-step values.  A steadily increasing allocated value
+            # indicates retained tensors; reserved memory alone is allocator cache.
+            gb = 1024 ** 3
+            metrics.update({
+                "memory/cuda_allocated_gb": torch.cuda.memory_allocated() / gb,
+                "memory/cuda_reserved_gb": torch.cuda.memory_reserved() / gb,
+                "memory/cuda_peak_allocated_gb": torch.cuda.max_memory_allocated() / gb,
+                "memory/cuda_peak_reserved_gb": torch.cuda.max_memory_reserved() / gb,
+            })
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""

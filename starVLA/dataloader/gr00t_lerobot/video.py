@@ -323,12 +323,16 @@ def get_all_frames(
         frames = decoder.get_frames_at(indices=range(len(decoder)))
         return frames.data.numpy(), frames.pts_seconds.numpy()
     elif video_backend == "pyav":
-        container = av.open(video_path)
-        frames = []
-        for frame in container.decode(video=0):
-            frame = frame.to_ndarray(format="rgb24")
-            frames.append(frame)
-        frames = np.array(frames)
+        container = None
+        try:
+            container = av.open(video_path)
+            frames = []
+            for frame in container.decode(video=0):
+                frames.append(frame.to_ndarray(format="rgb24"))
+            frames = np.array(frames)
+        finally:
+            if container is not None:
+                container.close()
     elif video_backend == "torchvision_av":
         # set backend and reader
         torchvision.set_video_backend("pyav")

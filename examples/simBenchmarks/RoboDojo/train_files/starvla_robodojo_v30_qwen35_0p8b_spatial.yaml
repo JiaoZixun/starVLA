@@ -54,7 +54,7 @@ trainer:
   max_train_steps: 5000
   num_warmup_steps: 5000
   save_interval: 1000
-  eval_interval: 1000
+  eval_interval: 10000
   pretrained_checkpoint: /public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/trained_checkpoint/robodojo_v30_qwen35_0p8b_oft/final_model/pytorch_model.pt
   learning_rate:
     base: 1.0e-5

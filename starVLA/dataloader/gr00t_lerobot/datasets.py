@@ -24,11 +24,12 @@ In this file, we define 3 types of datasets:
 See `scripts/load_dataset.py` for examples on how to use these datasets.
 """
 import os
+import errno
 import hashlib
 import io
 import json, torch
 import copy
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Sequence
 import os, random
@@ -640,7 +641,10 @@ class LeRobotSingleDataset(Dataset):
         # per episode so worker memory stays bounded and legacy datasets incur
         # zero overhead when the option is absent.
         self._spatial_sidecar_dir = None
-        self._spatial_episode_cache = {}
+        self._spatial_episode_cache = OrderedDict()
+        self._spatial_episode_cache_size = max(
+            1, int(self.data_cfg.get("spatial_episode_cache_size", 32))
+        ) if self.data_cfg is not None else 32
         if self.data_cfg is not None and self.data_cfg.get("spatial_sidecar_dir", None):
             self._spatial_sidecar_dir = Path(self.data_cfg.get("spatial_sidecar_dir"))
             if not (self._spatial_sidecar_dir / "manifest.json").exists():
@@ -1397,7 +1401,17 @@ class LeRobotSingleDataset(Dataset):
             entry = manifest["episodes"].get(str(eid))
             if entry is None:
                 raise KeyError(f"Episode {eid} is absent from spatial sidecar")
-            self._spatial_episode_cache[eid] = np.load(self._spatial_sidecar_dir / entry["file"], allow_pickle=False)
+            # NpzFile keeps its underlying zip file open until explicitly closed.
+            # Copy the small arrays we use, then close it before caching them.
+            with np.load(self._spatial_sidecar_dir / entry["file"], allow_pickle=False) as archive:
+                self._spatial_episode_cache[eid] = {
+                    key: archive[key].copy()
+                    for key in ("pose", "source_frame_index", "arm_mask")
+                }
+            while len(self._spatial_episode_cache) > self._spatial_episode_cache_size:
+                self._spatial_episode_cache.popitem(last=False)
+        else:
+            self._spatial_episode_cache.move_to_end(eid)
         z = self._spatial_episode_cache[eid]
         pose = np.asarray(z["pose"], dtype=np.float32)
         frame = np.asarray(z["source_frame_index"], dtype=np.int64)
@@ -1545,10 +1559,16 @@ class LeRobotSingleDataset(Dataset):
                 chunk_index=chunk_index, file_index=file_index
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            file_data = pd.read_parquet(parquet_path)
-            
-            # filter by trajectory_id
-            episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
+            # Every v3 parquet row group is written for one episode and carries
+            # episode_index statistics.  Predicate pushdown avoids loading the
+            # whole 60-100 MB shard for every sample.
+            episode_data = pd.read_parquet(
+                parquet_path,
+                engine="pyarrow",
+                filters=[("episode_index", "==", trajectory_id)],
+            )
+            self.curr_traj_id = trajectory_id
+            self.curr_traj_data = episode_data
             return episode_data
 
 
@@ -2504,6 +2524,11 @@ class LeRobotMixtureDataset(Dataset):
                 
             except Exception as e:
                 last_exception = e
+                # Retrying cannot recover from a process-wide file-descriptor
+                # limit.  Re-sampling here only obscures the original failure
+                # and can make the worker exhaust descriptors even faster.
+                if isinstance(e, OSError) and e.errno in (errno.EMFILE, errno.ENFILE):
+                    raise
                 if attempt < max_retries - 1:
                     # Log the error but continue trying
                     print(f"Attempt {attempt + 1}/{max_retries} failed for index {index}: {e}")

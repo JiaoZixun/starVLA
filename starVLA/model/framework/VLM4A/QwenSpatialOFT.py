@@ -116,9 +116,17 @@ class QwenSpatialOFT(Qwenvl_OFT):
         qin = self.qwen_vl_interface.build_qwenvl_inputs(images=images,
                                                           instructions=[x + suffix for x in instructions])
         with torch.autocast("cuda", dtype=get_training_dtype()):
-            out = self.qwen_vl_interface(**qin, output_attentions=False,
-                                         output_hidden_states=True, return_dict=True)
-            hidden = out.hidden_states[-1]
+            # The spatial branch only consumes the final representation.  Asking
+            # Transformers for all layer outputs retains one activation tensor per
+            # layer until the forward returns and needlessly raises the peak.
+            out = self.qwen_vl_interface(
+                **qin,
+                output_attentions=False,
+                output_hidden_states=False,
+                use_cache=False,
+                return_dict=True,
+            )
+            hidden = out.last_hidden_state
         ids = qin.get("input_ids")
         ah = self._gather_action_token_embeddings(hidden, ids, self.action_token_id)
         return qin, hidden, ah

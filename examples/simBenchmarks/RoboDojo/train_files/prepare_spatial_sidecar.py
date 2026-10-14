@@ -67,9 +67,10 @@ def build(data_root, out_root, urdf):
 def validate(sidecar):
     m=json.loads((sidecar/'manifest.json').read_text()); checked=0
     for eid,meta in tqdm(m['episodes'].items(),desc='Validating geometry'):
-        z=np.load(sidecar/meta['file']); p=z['pose']; r=p[...,:3,:3]
-        assert np.isfinite(p).all() and np.max(np.abs(np.matmul(r.transpose(0,1,3,2),r)-np.eye(3)))<2e-4
-        assert np.allclose(np.linalg.det(r),1,atol=2e-4); assert np.all(np.diff(z['source_frame_index'])>=0); checked+=len(p)
+        with np.load(sidecar/meta['file'], allow_pickle=False) as z:
+            p=z['pose']; r=p[...,:3,:3]
+            assert np.isfinite(p).all() and np.max(np.abs(np.matmul(r.transpose(0,1,3,2),r)-np.eye(3)))<2e-4
+            assert np.allclose(np.linalg.det(r),1,atol=2e-4); assert np.all(np.diff(z['source_frame_index'])>=0); checked+=len(p)
     print(f'Validated {checked} frames, {len(m["episodes"])} episodes')
 
 if __name__=='__main__':

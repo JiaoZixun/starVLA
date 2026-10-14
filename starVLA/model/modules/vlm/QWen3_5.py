@@ -102,7 +102,7 @@ class _QWen3_5_VL_Interface(nn.Module):
         Forward pass delegating to underlying Qwen3.5-VL backbone.
         """
 
-        if self.training and self.config.framework.name == "QwenOFT" and kwargs.get("labels") is None:
+        if self.training and self.config.framework.name in {"QwenOFT", "QwenSpatialOFT"} and kwargs.get("labels") is None:
             # OFT uses hidden states; full vocabulary logits and KV caches are unused.
             kwargs.setdefault("logits_to_keep", 1)
             kwargs.setdefault("use_cache", False)
