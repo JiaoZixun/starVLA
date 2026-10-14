@@ -422,8 +422,12 @@ class VLATrainer(TrainerUtils):
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
-                action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                action_loss = output_dict.get("bc_loss", output_dict.get("action_loss"))
+                if action_loss is None:
+                    raise KeyError("Model forward must return `bc_loss` or legacy `action_loss`")
+                total_loss = output_dict.get("total_loss", action_loss)
+                if not torch.is_tensor(total_loss):
+                    raise TypeError(f"Model total_loss must be a tensor, got {type(total_loss).__name__}")
 
             self.accelerator.backward(total_loss)
 
@@ -439,9 +443,19 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        metrics = {"action_dit_loss": action_loss.item(), "total_loss": total_loss.detach().item()}
+        for key in (
+            "waypoint_loss",
+            "waypoint_translation_loss",
+            "waypoint_rotation_loss",
+            "relation_loss",
+            "action_geometry_loss",
+            "spatial_residual_ratio",
+        ):
+            value = output_dict.get(key)
+            if torch.is_tensor(value):
+                metrics[key] = value.detach().item()
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""

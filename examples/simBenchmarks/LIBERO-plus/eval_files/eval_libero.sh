@@ -1,24 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 LIBERO_HOME="${LIBERO_HOME:-}"
 LIBERO_Python="${LIBERO_Python:-python}"
-MUJOCO_GL="${MUJOCO_GL:-osmesa}"
-PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
+GPU_ID="${GPU_ID:-${gpu_id:-0}}"
+NVIDIA_EGL_VENDOR_JSON="${NVIDIA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
 host="${host:-127.0.0.1}"
 your_ckpt="${your_ckpt:-/path/to/checkpoint.pt}"
 output_dir="${output_dir:-${STARVLA_DIR}/results/libero_plus_eval}"
-gpu_id="${gpu_id:-0}"
 
 if [[ -z "${LIBERO_HOME}" ]]; then
   echo "LIBERO_HOME is required."
+  exit 1
+fi
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi --query-gpu=index --format=csv,noheader,nounits \
+  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -Fxq -- "${GPU_ID}"; then
+  echo "GPU_ID='${GPU_ID}' is not an available NVIDIA GPU." >&2
+  exit 1
+fi
+if [[ "${MUJOCO_GL:-egl}" != "egl" || "${PYOPENGL_PLATFORM:-egl}" != "egl" ]]; then
+  echo "LIBERO-plus evaluation requires NVIDIA EGL (MUJOCO_GL=egl, PYOPENGL_PLATFORM=egl)." >&2
+  exit 2
+fi
+if [[ ! -r "${NVIDIA_EGL_VENDOR_JSON}" ]]; then
+  echo "NVIDIA EGL vendor file is not readable: ${NVIDIA_EGL_VENDOR_JSON}" >&2
   exit 1
 fi
 
 cd "${STARVLA_DIR}"
 export LIBERO_CONFIG_PATH="${LIBERO_HOME}/libero"
 export PYTHONPATH="${PYTHONPATH:-}:${LIBERO_HOME}:${STARVLA_DIR}"
+export CUDA_VISIBLE_DEVICES="${GPU_ID}"
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export __EGL_VENDOR_LIBRARY_FILENAMES="${NVIDIA_EGL_VENDOR_JSON}"
+export MUJOCO_EGL_DEVICE_ID="${GPU_ID}"
+
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${LIBERO_Python}" \
+  "${STARVLA_DIR}/examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py"
 
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 LOG_DIR="${output_dir}/logs/$(date +"%Y%m%d_%H%M%S")"
@@ -30,7 +50,7 @@ num_trials_per_task=1
 video_out_path="${output_dir}/${task_suite_name}/${folder_name}"
 log_file="${LOG_DIR}/${task_suite_name}.log"
 
-CUDA_VISIBLE_DEVICES="${gpu_id}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
     --args.host "$host" \
     --args.port $base_port \
@@ -50,7 +70,7 @@ num_trials_per_task=1
 video_out_path="${output_dir}/${task_suite_name}/${folder_name}"
 log_file="${LOG_DIR}/${task_suite_name}.log"
 
-CUDA_VISIBLE_DEVICES="${gpu_id}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
     --args.host "$host" \
     --args.port $base_port \
@@ -68,7 +88,7 @@ num_trials_per_task=1
 video_out_path="${output_dir}/${task_suite_name}/${folder_name}"
 log_file="${LOG_DIR}/${task_suite_name}.log"
 
-CUDA_VISIBLE_DEVICES="${gpu_id}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
     --args.host "$host" \
     --args.port $base_port \
@@ -87,7 +107,7 @@ num_trials_per_task=1
 video_out_path="${output_dir}/${task_suite_name}/${folder_name}"
 log_file="${LOG_DIR}/${task_suite_name}.log"
 
-CUDA_VISIBLE_DEVICES="${gpu_id}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${LIBERO_Python}" ./examples/simBenchmarks/LIBERO-plus/eval_files/eval_libero.py \
     --args.pretrained-path ${your_ckpt} \
     --args.host "$host" \
     --args.port $base_port \

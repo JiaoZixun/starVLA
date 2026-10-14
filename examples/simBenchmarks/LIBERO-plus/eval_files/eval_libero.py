@@ -15,6 +15,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.simBenchmarks.LIBERO.eval_files.model2libero_interface import ModelClient
+from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -179,6 +180,12 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    # QwenSpatialOFT uses the measured EEF pose as its current
+                    # geometry anchor. Baseline QwenOFT simply ignores this field.
+                    "geometry_current": {
+                        "eef_pose": pose_from_position_axis_angle(state[:3], state[3:6]),
+                        "arm_mask": np.asarray([True], dtype=np.bool_),
+                    },
                 }
 
                 start_time = time.time()

@@ -20,6 +20,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.tools import read_mode_config
+from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
@@ -127,6 +128,7 @@ class Args:
     start_idx: int = -1
     end_idx: int = -1
     output_dir: str = "./output"
+    save_videos: bool = False
 
 
 class PolicyModel:
@@ -464,7 +466,8 @@ def eval_libero(args: Args) -> None:
                 wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
 
                 # Save preprocessed image for replay video
-                replay_images.append(img)
+                if args.save_videos:
+                    replay_images.append(img)
 
                 state = np.concatenate(
                     (
@@ -484,7 +487,11 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
-                    # "state": observation["observation.state"],
+                    # SpatialOFT needs the measured EEF pose as its geometry anchor.
+                    "geometry_current": {
+                        "eef_pose": pose_from_position_axis_angle(state[:3], state[3:6]),
+                        "arm_mask": np.asarray([True], dtype=np.bool_),
+                    },
                 }
 
                 start_time = time.time()
@@ -537,11 +544,12 @@ def eval_libero(args: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
 
-            imageio.mimwrite(
-                pathlib.Path(video_out_path) / f"rollout_{ID2CATEGORY[task_id+1][1]}_episode{episode_idx}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=25,
-            )
+            if args.save_videos:
+                imageio.mimwrite(
+                    pathlib.Path(video_out_path) / f"rollout_{ID2CATEGORY[task_id+1][1]}_episode{episode_idx}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=25,
+                )
 
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
@@ -555,6 +563,7 @@ def eval_libero(args: Args) -> None:
         # Log final results
         logger.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logger.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        env.close()
     with open(os.path.join(log_path, f"{args.start_idx}_to_{args.end_idx}.json"), "w", encoding="utf-8") as f:
         json.dump(disturb_res, f)
     logger.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")

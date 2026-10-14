@@ -160,6 +160,7 @@ playground/BuildData
 playground/Checkpoints
 playground/Pretrained_models
 playground/Datasets
+playground/DerivedData
 
 eval/SimplerEnv
 
@@ -247,6 +248,7 @@ wandb/*
 !docs/model_zoo.md
 !docs/starVLA_guideline.md
 !docs/WM4A.md
+!docs/starvla_qwen35_0p8b_oft_libero_50k_baseline.md
 
 
 logs/*

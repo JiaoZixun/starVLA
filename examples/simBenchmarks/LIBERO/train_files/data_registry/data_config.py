@@ -4,6 +4,7 @@ from starVLA.dataloader.gr00t_lerobot.datasets import ModalityConfig
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
+from starVLA.dataloader.geometry_lerobot_dataset import SpatialLeRobotSingleDataset
 
 
 # ---------------------------------------------------------------------------
@@ -96,9 +97,27 @@ class OpenPILibero4in1DataConfig(Libero4in1DataConfig):
         ])
 
 
+class SpatialLibero4in1DataConfig(Libero4in1DataConfig):
+    """LIBERO contract with pose labels joined from an external sidecar."""
+
+    def make_dataset(self, **kwargs):
+        data_cfg = kwargs.get("data_cfg")
+        if data_cfg is None:
+            raise ValueError("Spatial LIBERO training requires datasets.vla_data.geometry_sidecar_root")
+        sidecar_root = data_cfg.get("geometry_sidecar_root")
+        if not sidecar_root:
+            raise ValueError("Spatial LIBERO training requires datasets.vla_data.geometry_sidecar_root")
+        return SpatialLeRobotSingleDataset(
+            **kwargs,
+            geometry_sidecar_root=sidecar_root,
+            waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 2, 4, 8])),
+        )
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
     "openpi_libero_franka": OpenPILibero4in1DataConfig(),
+    "libero_spatial_oft_franka": SpatialLibero4in1DataConfig(),
 }
 
 
@@ -127,6 +146,12 @@ DATASET_NAMED_MIXTURES = {
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "openpi_libero_franka"),
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "openpi_libero_franka"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "openpi_libero_franka"),
+    ],
+    "libero_spatial_oft_all": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
     ],
     "libero_goal": [
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),

@@ -53,6 +53,45 @@ pip install numpy==1.24.4 mujoco==3.2.3
 
 ## 🚀 2. Evaluation Workflow
 
+LIBERO-plus rendering must use the selected NVIDIA GPU through EGL. The launchers
+reject non-EGL settings, verify the NVIDIA EGL vendor file, and create a test EGL
+context before starting evaluation. Set `GPU_ID` to the GPU index visible to the
+host (for example `GPU_ID=0`). Keep this rendering rule for future LIBERO-plus
+evaluation and training scripts; other benchmark rendering configurations are
+independent and should remain unchanged.
+
+### Checkpoints and evaluation protocol
+
+The local 0.8B checkpoints for zero-shot evaluation are:
+
+| Model | Checkpoint |
+|---|---|
+| OFT baseline | `playground/Checkpoints/qwen35_0p8b_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt` |
+| Spatial OFT | `playground/Checkpoints/qwen35_0p8b_spatial_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt` |
+
+For each model, use the same checkpoint in `run_policy_server.sh` and
+`eval_libero.sh`, restarting the server when switching checkpoints. The regular
+launcher uses the StarVLA policy server on port 9883; the LIBERO-plus process
+connects over the StarVLA client interface and reads that checkpoint's action
+normalization statistics (`franka`). Spatial OFT also receives the current
+end-effector pose from the simulator. The Nebula parallel evaluator instead
+loads the checkpoint in its evaluation workers and runs inference in-process.
+
+The full benchmark contains 10,030 tasks. The provided shell launchers run one
+episode per task, so the full run contains 10,030 episodes:
+
+| Suite | Tasks | Episodes per task |
+|---|---:|---:|
+| `libero_10` | 2,519 | 1 |
+| `libero_goal` | 2,591 | 1 |
+| `libero_object` | 2,518 | 1 |
+| `libero_spatial` | 2,402 | 1 |
+| **Total** | **10,030** | **1** |
+
+These counts and the one-episode setting are defined by the parallel launcher's
+suite slices and `num_trials_per_task=1`; direct Python evaluator defaults are
+50 trials per task, so use the provided launchers for this protocol.
+
 The evaluation should be run **from the repository root** using **two separate terminals**, one for each environment:  
 
 - **starVLA environment**: runs the inference server.  

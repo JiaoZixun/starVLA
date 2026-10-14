@@ -15,6 +15,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.simBenchmarks.LIBERO.eval_files.model2libero_interface import ModelClient
+from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -108,6 +109,9 @@ def eval_libero(args: Args) -> None:
     task_ids = range(task_start, task_end)
     save_videos = os.getenv("SAVE_VIDEOS", "1").lower() not in {"0", "false", "no", "off"}
     max_videos_per_outcome = int(os.getenv("MAX_VIDEOS_PER_OUTCOME", "1"))
+    stop_after_both_videos = os.getenv("STOP_AFTER_BOTH_VIDEOS", "0").lower() in {
+        "1", "true", "yes", "on"
+    }
     if max_videos_per_outcome < 1:
         raise ValueError("MAX_VIDEOS_PER_OUTCOME must be >= 1")
     logging.info(
@@ -133,6 +137,8 @@ def eval_libero(args: Args) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        if client_model.record_inference_timing:
+            client_model.set_timing_task_context(task_id, task_description)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -196,6 +202,11 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    # Current measured TCP pose is available at inference; future labels stay training-only.
+                    "geometry_current": {
+                        "eef_pose": pose_from_position_axis_angle(state[:3], state[3:6]),
+                        "arm_mask": np.asarray([True], dtype=np.bool_),
+                    },
                 }
 
                 start_time = time.time()
@@ -266,6 +277,17 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            if (
+                stop_after_both_videos
+                and save_videos
+                and all(count >= max_videos_per_outcome for count in saved_task_videos.values())
+            ):
+                logging.info(
+                    "Captured the configured success and failure videos after %d episode(s); "
+                    "stopping this task early.",
+                    task_episodes,
+                )
+                break
 
         # Log final results
         task_success_rate = float(task_successes) / float(task_episodes)
@@ -293,6 +315,13 @@ def eval_libero(args: Args) -> None:
     with open(pathlib.Path(args.video_out_path) / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
+
+    if client_model.record_inference_timing:
+        timing_path = pathlib.Path(args.video_out_path) / "inference_timing.json"
+        with timing_path.open("w", encoding="utf-8") as f:
+            json.dump(client_model.inference_timing_summary(args.num_trials_per_task), f, indent=2)
+            f.write("\n")
+        logging.info("Inference timing summary saved to %s", timing_path)
 
     logging.info(f"Total success rate: {success_rate}")
     logging.info(f"Total episodes: {total_episodes}")
