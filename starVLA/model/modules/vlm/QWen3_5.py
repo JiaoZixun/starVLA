@@ -114,6 +114,16 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         return outputs
 
+    def forward_hidden_states(self, **kwargs) -> torch.Tensor:
+        """Run the multimodal backbone without constructing language logits."""
+        kwargs.setdefault("output_attentions", False)
+        kwargs.setdefault("output_hidden_states", False)
+        kwargs.setdefault("use_cache", False)
+        kwargs.setdefault("return_dict", True)
+        with torch.autocast("cuda", dtype=get_training_dtype()):
+            outputs = self.model.model(**kwargs)
+        return outputs.last_hidden_state
+
     def generate(
         self,
         **kwargs,

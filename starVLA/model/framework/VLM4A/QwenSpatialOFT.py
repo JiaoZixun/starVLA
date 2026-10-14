@@ -115,18 +115,11 @@ class QwenSpatialOFT(Qwenvl_OFT):
         suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{self.action_token * self.chunk_len}<action>."
         qin = self.qwen_vl_interface.build_qwenvl_inputs(images=images,
                                                           instructions=[x + suffix for x in instructions])
-        with torch.autocast("cuda", dtype=get_training_dtype()):
-            # The spatial branch only consumes the final representation.  Asking
-            # Transformers for all layer outputs retains one activation tensor per
-            # layer until the forward returns and needlessly raises the peak.
-            out = self.qwen_vl_interface(
-                **qin,
-                output_attentions=False,
-                output_hidden_states=False,
-                use_cache=False,
-                return_dict=True,
-            )
-            hidden = out.last_hidden_state
+        # The causal-LM wrapper returns logits/hidden_states, while the final
+        # representation lives on its multimodal backbone. Calling that backbone
+        # directly avoids both the missing ``last_hidden_state`` field and the
+        # unnecessary vocabulary projection.
+        hidden = self.qwen_vl_interface.forward_hidden_states(**qin)
         ids = qin.get("input_ids")
         ah = self._gather_action_token_embeddings(hidden, ids, self.action_token_id)
         return qin, hidden, ah
