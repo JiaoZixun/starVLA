@@ -108,9 +108,23 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
         future_indices = [frame_index + tau for tau in self.waypoint_tau]
         future_valid = np.asarray([index < episode_length for index in future_indices], dtype=np.bool_)
         future = np.broadcast_to(np.eye(4, dtype=np.float32), (len(self.waypoint_tau), 4, 4)).copy()
+        future_gripper = np.zeros((len(self.waypoint_tau),), dtype=np.float32)
+        future_gripper_valid = future_valid.copy()
+        # ``observation.state`` is read only for supervision.  It is never
+        # passed to the model as a future input, so this remains causal at
+        # inference time.
+        trajectory = self.curr_traj_data
+        if trajectory is None or "observation.state" not in trajectory.columns:
+            future_gripper_valid[:] = False
         for waypoint_index, source_index in enumerate(future_indices):
             if future_valid[waypoint_index]:
                 future[waypoint_index] = np.asarray(poses[offset + source_index], dtype=np.float32)
+                if future_gripper_valid[waypoint_index]:
+                    state_value = np.asarray(trajectory.iloc[source_index]["observation.state"], dtype=np.float32)
+                    if state_value.shape != (8,) or not np.isfinite(state_value).all():
+                        future_gripper_valid[waypoint_index] = False
+                    else:
+                        future_gripper[waypoint_index] = state_value[7]
         current_rotation_t = current[:3, :3].T
         relative = np.broadcast_to(np.eye(4, dtype=np.float32), (len(self.waypoint_tau), 4, 4)).copy()
         relative[:, :3, :3] = current_rotation_t[None, :, :] @ future[:, :3, :3]
@@ -127,6 +141,8 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
         sample["geometry_labels"] = {
             "relative_waypoints": relative,
             "future_valid": future_valid,
+            "future_gripper": future_gripper,
+            "future_gripper_valid": future_gripper_valid,
             "source_frame_index": np.asarray(frame_index, dtype=np.int64),
         }
         return sample

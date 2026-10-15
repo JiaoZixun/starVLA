@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
+STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../../.." && pwd)}"
 LIBERO_HOME="${LIBERO_HOME:-}"
 LIBERO_PYTHON="${LIBERO_PYTHON:-python}"
 GPU_ID="${GPU_ID:-${gpu_id:-0}}"
@@ -53,7 +53,7 @@ fi
 
 cd "${STARVLA_DIR}"
 export LIBERO_CONFIG_PATH="${LIBERO_HOME}/libero"
-export PYTHONPATH="${LIBERO_HOME}/libero:${LIBERO_HOME}:${STARVLA_DIR}:${PYTHONPATH:-}"
+export PYTHONPATH="${LIBERO_HOME}:${STARVLA_DIR}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
