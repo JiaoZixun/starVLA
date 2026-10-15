@@ -174,11 +174,14 @@ class CausalExecutionMemory(nn.Module):
         for attention, norm in zip(self.retrieval_layers, self.retrieval_norms):
             update, _ = attention(query, retrieval, retrieval, key_padding_mask=padding, need_weights=False)
             query = norm(query + update)
-        summary = query.mean(dim=1)
+        # The same per-query memory gate controls the summary consumed by the
+        # waypoint path and the residual consumed by the action path.
+        retrieval_summary = query.mean(dim=1)
         elapsed_summary = torch.as_tensor(records["elapsed_env_steps"], device=action_queries.device, dtype=torch.float32)
         elapsed_summary = (elapsed_summary * valid.float()).sum(dim=1, keepdim=True) / valid.float().sum(dim=1, keepdim=True).clamp_min(1.0)
-        gate_input = torch.cat((action_queries, summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1), elapsed_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1)), dim=-1)
+        gate_input = torch.cat((action_queries, retrieval_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1), elapsed_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1)), dim=-1)
         gates = self.gate(gate_input)
+        summary = (query * gates).mean(dim=1)
         conditioned = action_queries + self.output_projection(gates * query)
         return conditioned, retrieval, retrieval_valid, summary, gates.mean(dim=1), gates.detach()
 
@@ -318,7 +321,13 @@ class QwenSpatialOFT(Qwenvl_OFT):
         self.waypoint_weight = float(spatial.get("waypoint_weight", 1.0))
         self.waypoint_rotation_weight = float(spatial.get("waypoint_rotation_weight", 0.25))
         self.gripper_weight = float(spatial.get("gripper_weight", 0.10))
+        self.effect_weight = float(spatial.get("effect_weight", 0.0))
         self.action_geometry_weight = float(spatial.get("action_geometry_weight", 0.0))
+        if self.effect_weight != 0.0:
+            raise NotImplementedError(
+                "Effect supervision is disabled until the LIBERO action/observation phase contract is verified; "
+                "keep spatial.effect_weight=0.0"
+            )
         if self.action_geometry_weight != 0.0:
             raise NotImplementedError(
                 "LIBERO action-geometry supervision is not implemented because the action-row/pre-action "
@@ -371,7 +380,13 @@ class QwenSpatialOFT(Qwenvl_OFT):
         conditioned, residual, spatial_gate = self.spatial_adapter(
             action_queries, translation, rotation_6d, gripper, tau
         )
-        return conditioned, residual, {"spatial_gate_mean": spatial_gate}
+        spatial_gate = spatial_gate.float()
+        return conditioned, residual, {
+            "spatial_gate_mean": spatial_gate.mean(),
+            "spatial_gate_std": spatial_gate.std(unbiased=False),
+            "spatial_gate_min": spatial_gate.min(),
+            "spatial_gate_max": spatial_gate.max(),
+        }
 
     def _condition_memory(
         self,

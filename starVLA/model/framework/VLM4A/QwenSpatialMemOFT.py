@@ -161,8 +161,12 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             # action path.  The projection is zero-initialized so the original
             # spatial checkpoint remains the optimization starting point.
             waypoint_features = last_hidden + self.memory_waypoint_projection(memory_summary).unsqueeze(1)
+        memory_gate = memory_gate.detach().float()
         return waypoint_features, memory_conditioned, attention_mask, {
-            "memory_gate_mean": memory_gate.detach().float().mean(),
+            "memory_gate_mean": memory_gate.mean(),
+            "memory_gate_std": memory_gate.std(unbiased=False),
+            "memory_gate_min": memory_gate.min(),
+            "memory_gate_max": memory_gate.max(),
             "memory_gate_channel_mean": memory_channel_gate.detach().float().mean(),
         }
 

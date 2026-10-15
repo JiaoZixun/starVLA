@@ -499,6 +499,14 @@ class VLATrainer(TrainerUtils):
             "action_geometry_loss",
             "spatial_residual_ratio",
             "memory_gate_mean",
+            "memory_gate_std",
+            "memory_gate_min",
+            "memory_gate_max",
+            "memory_gate_channel_mean",
+            "spatial_gate_mean",
+            "spatial_gate_std",
+            "spatial_gate_min",
+            "spatial_gate_max",
         ):
             value = output_dict.get(key)
             if torch.is_tensor(value):

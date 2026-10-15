@@ -245,6 +245,7 @@ wandb/*
 !docs/PR_readme.md
 !docs/CONTRIBUTING.md
 !docs/faq.md
+!docs/qwen35_0p8b_spatial_memory_oft_implementation.md
 !docs/model_zoo.md
 !docs/starVLA_guideline.md
 !docs/WM4A.md
