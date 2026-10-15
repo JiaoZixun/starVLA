@@ -246,9 +246,13 @@ class PolicyModel:
         action_chunk_size = self.action_chunk_size
         if step % action_chunk_size == 0:
             if self.memory_buffer is not None:
+                # Training rebuilds the long-term slots from the stride-aligned
+                # prefix that precedes the recent window; eval must feed the
+                # same prefix or the slots start from the seed every episode.
                 example = {
                     **example,
                     "memory_records": self.memory_buffer.build(step),
+                    "memory_burnin_records": self.memory_buffer.build_burnin(step),
                     "memory_contract": {
                         "history_is_strictly_past": True,
                         "decision_stride_env_steps": self.memory_buffer.decision_stride,

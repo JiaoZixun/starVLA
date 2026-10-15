@@ -6,7 +6,13 @@ STARVLA_DIR="${STARVLA_DIR:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}"
 LIBERO_HOME="${LIBERO_HOME:-${STARVLA_DIR}/playground/LIBERO-plus}"
 LIBERO_PYTHON="${LIBERO_PYTHON:-/data1/jiaozx/anaconda3/envs/fastvla-fla/bin/python}"
 BASELINE_CKPT="${BASELINE_CKPT:-${STARVLA_DIR}/playground/Checkpoints/qwen35_0p8b_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt}"
+BASELINE_CKPT_BYTES="${BASELINE_CKPT_BYTES:-1748288891}"
 SPATIAL_CKPT="${SPATIAL_CKPT:-${STARVLA_DIR}/playground/Checkpoints/qwen35_0p8b_spatial_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt}"
+SPATIAL_CKPT_BYTES="${SPATIAL_CKPT_BYTES:-1761788779}"
+# Spatial + causal memory. The memory modules change the state-dict size, so the
+# expected byte count is discovered from the file itself unless pinned here.
+MEM_CKPT="${MEM_CKPT:-${STARVLA_DIR}/playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt}"
+MEM_CKPT_BYTES="${MEM_CKPT_BYTES:-auto}"
 HF_CACHE="${HF_HOME:-/data1/jiaozx/.cache/huggingface}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-0.8B}"
 NVIDIA_EGL_VENDOR_JSON="${NVIDIA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
@@ -38,17 +44,36 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 [[ "${NUM_TRIALS_PER_TASK}" == 1 ]] || fail "Official LIBERO-plus protocol uses NUM_TRIALS_PER_TASK=1."
 [[ "${TASKS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] || fail "TASKS_PER_GPU must be a positive integer."
 [[ "${SAVE_VIDEOS}" =~ ^[01]$ ]] || fail "SAVE_VIDEOS must be 0 or 1."
-[[ "${MODEL_SELECTION}" =~ ^(baseline|spatial|both)$ ]] || fail "MODEL_SELECTION must be baseline, spatial, or both."
+[[ "${MODEL_SELECTION}" =~ ^(baseline|spatial|mem|both|all)$ ]] || fail "MODEL_SELECTION must be baseline, spatial, mem, both, or all."
 [[ "${EVAL_GPU_ID}" =~ ^[0-9]+$ ]] || fail "EVAL_GPU_ID must be a non-negative GPU index."
 command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi is required."
 nvidia-smi --query-gpu=index --format=csv,noheader,nounits \
   | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "${EVAL_GPU_ID}" \
   || fail "GPU ${EVAL_GPU_ID} is unavailable."
 
-[[ -s "${BASELINE_CKPT}" ]] || fail "Checkpoint is missing or empty: ${BASELINE_CKPT}"
-[[ "$(stat -c '%s' "${BASELINE_CKPT}")" == "1748288891" ]] || fail "Baseline checkpoint has an unexpected size: ${BASELINE_CKPT}"
-[[ -s "${SPATIAL_CKPT}" ]] || fail "Checkpoint is missing or empty: ${SPATIAL_CKPT}"
-[[ "$(stat -c '%s' "${SPATIAL_CKPT}")" == "1761788779" ]] || fail "Spatial checkpoint has an unexpected size: ${SPATIAL_CKPT}"
+check_checkpoint() {
+  local label="$1" path="$2" expected="$3"
+  [[ -s "${path}" ]] || fail "${label} checkpoint is missing or empty: ${path}"
+  local actual
+  actual="$(stat -c '%s' "${path}")"
+  if [[ "${expected}" == "auto" ]]; then
+    echo "${label} checkpoint size (auto): ${actual} bytes"
+  elif [[ "${actual}" != "${expected}" ]]; then
+    fail "${label} checkpoint has an unexpected size: ${path} (${actual} != ${expected})"
+  fi
+}
+
+# Only the selected models are validated, so evaluating `mem` alone does not
+# fail on a checkpoint that is not part of this run.
+case "${MODEL_SELECTION}" in
+  baseline|both|all) check_checkpoint baseline "${BASELINE_CKPT}" "${BASELINE_CKPT_BYTES}" ;;
+esac
+case "${MODEL_SELECTION}" in
+  spatial|both|all) check_checkpoint spatial "${SPATIAL_CKPT}" "${SPATIAL_CKPT_BYTES}" ;;
+esac
+case "${MODEL_SELECTION}" in
+  mem|all) check_checkpoint mem "${MEM_CKPT}" "${MEM_CKPT_BYTES}" ;;
+esac
 
 ASSET_ROOT="${LIBERO_HOME}/libero/libero/assets"
 for asset_dir in articulated_objects new_objects scenes textures; do
@@ -186,7 +211,7 @@ PY
 
 echo "Preflight passed. No policy evaluation has been launched."
 echo "Result root: ${RESULT_ROOT}"
-echo "Checkpoints: ${BASELINE_CKPT} ; ${SPATIAL_CKPT}"
+echo "Checkpoints: ${BASELINE_CKPT} ; ${SPATIAL_CKPT} ; ${MEM_CKPT}"
 EPISODES_PER_MODEL=0
 for suite in "${SUITES[@]}"; do
   EPISODES_PER_MODEL=$((EPISODES_PER_MODEL + SUITE_TASKS[${suite}] * NUM_TRIALS_PER_TASK))
@@ -194,7 +219,11 @@ done
 HISTORICAL_EPISODES=2000
 HISTORICAL_MINUTES=70
 ESTIMATED_MODEL_MINUTES=$(( (EPISODES_PER_MODEL * HISTORICAL_MINUTES + HISTORICAL_EPISODES - 1) / HISTORICAL_EPISODES ))
-if [[ "${MODEL_SELECTION}" == "both" ]]; then MODEL_COUNT=2; else MODEL_COUNT=1; fi
+case "${MODEL_SELECTION}" in
+  both) MODEL_COUNT=2 ;;
+  all) MODEL_COUNT=3 ;;
+  *) MODEL_COUNT=1 ;;
+esac
 ESTIMATED_TOTAL_MINUTES=$((ESTIMATED_MODEL_MINUTES * MODEL_COUNT))
 echo "GPU: ${EVAL_GPU_ID}; four suites per model run in parallel; selected models run sequentially."
 echo "Episodes per model: ${EPISODES_PER_MODEL} (${NUM_TRIALS_PER_TASK} per task)"
@@ -235,6 +264,7 @@ launch_model() {
 
 baseline_status=0
 spatial_status=0
+mem_status=0
 case "${MODEL_SELECTION}" in
   baseline)
     launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
@@ -242,14 +272,22 @@ case "${MODEL_SELECTION}" in
   spatial)
     launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
     ;;
+  mem)
+    launch_model mem "${MEM_CKPT}" || mem_status=$?
+    ;;
   both)
     launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
     launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
     ;;
+  all)
+    launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
+    launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
+    launch_model mem "${MEM_CKPT}" || mem_status=$?
+    ;;
 esac
 
-if (( baseline_status != 0 || spatial_status != 0 )); then
-  echo "Evaluation failed: baseline=${baseline_status}, spatial=${spatial_status}. See ${RESULT_ROOT}." >&2
+if (( baseline_status != 0 || spatial_status != 0 || mem_status != 0 )); then
+  echo "Evaluation failed: baseline=${baseline_status}, spatial=${spatial_status}, mem=${mem_status}. See ${RESULT_ROOT}." >&2
   exit 1
 fi
 echo "LIBERO-plus evaluation completed (${MODEL_SELECTION}). Results: ${RESULT_ROOT}"

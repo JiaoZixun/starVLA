@@ -18,6 +18,11 @@ MEMORY_VISUAL_FEATURE_DIM = 3
 MEMORY_VISUAL_VIEWS = 2
 MEMORY_RECENT_RECORDS = 32
 MEMORY_DECISION_STRIDE = 8
+# Evaluation keeps the whole episode so the long-term memory slots can be
+# rebuilt with the same burn-in pass the training loader uses. The cap only
+# bounds memory on a pathological run; a LIBERO episode needs at most a few
+# hundred decision records.
+MEMORY_MAX_HISTORY_RECORDS = 4096
 
 
 def image_to_memory_tokens(image: Any) -> np.ndarray:
@@ -71,10 +76,59 @@ class LiberoMemoryBuffer:
         self.decision_stride = int(decision_stride)
         if self.recent_records < 1 or self.decision_stride < 1:
             raise ValueError("recent_records and decision_stride must be positive")
-        self.records: deque[dict[str, Any]] = deque(maxlen=self.recent_records)
+        # The whole episode is retained so the long-term slots can be rebuilt
+        # from the same prefix the training loader burn-in uses. `build` still
+        # exposes only the right-aligned recent window.
+        self.records: deque[dict[str, Any]] = deque(maxlen=MEMORY_MAX_HISTORY_RECORDS)
 
     def reset(self) -> None:
         self.records.clear()
+
+    def _recent_records(self) -> list[dict[str, Any]]:
+        """Return the newest ``recent_records`` committed records, oldest first."""
+        if len(self.records) <= self.recent_records:
+            return list(self.records)
+        return list(self.records)[-self.recent_records :]
+
+    def build_burnin(self, current_step: int) -> dict[str, np.ndarray]:
+        """Prefix records that precede the recent window, in training format.
+
+        Mirrors ``MemoryLeRobotSingleDataset._memory_burnin_records``: every
+        stride-aligned record strictly older than the recent window, with
+        ``elapsed_env_steps`` fixed at one decision stride. Only records already
+        committed by ``append`` are used, so no current or future observation
+        can enter the long-term state.
+        """
+        current_step = int(current_step)
+        cutoff = current_step - self.decision_stride * self.recent_records
+        burnin = [record for record in self.records if int(record["source_step"]) < cutoff]
+        for record in burnin:
+            if int(record["source_step"]) >= current_step:
+                raise ValueError(
+                    f"Burn-in is not strictly past: record step {record['source_step']} "
+                    f">= current step {current_step}"
+                )
+        count = len(burnin)
+        return {
+            "visual_tokens": np.stack([record["visual_tokens"] for record in burnin])
+            if count
+            else np.zeros((0, MEMORY_VISUAL_VIEWS, MEMORY_VISUAL_TOKENS, MEMORY_PATCH_SIZE, MEMORY_PATCH_SIZE, MEMORY_VISUAL_FEATURE_DIM), dtype=np.uint8),
+            "state": np.stack([record["state"] for record in burnin])
+            if count
+            else np.zeros((0, 8), dtype=np.float32),
+            "executed_actions": np.stack([record["executed_actions"] for record in burnin])
+            if count
+            else np.zeros((0, 7), dtype=np.float32),
+            "eef_pose": np.stack([record["eef_pose"] for record in burnin])
+            if count
+            else np.zeros((0, 4, 4), dtype=np.float32),
+            # Training stores a constant decision stride for burn-in records.
+            "elapsed_env_steps": np.full((count,), float(self.decision_stride), dtype=np.float32),
+            "valid_mask": np.ones((count,), dtype=np.bool_),
+            "source_frame_index": np.asarray(
+                [int(record["source_step"]) for record in burnin], dtype=np.int64
+            ),
+        }
 
     def build(self, current_step: int) -> dict[str, np.ndarray]:
         current_step = int(current_step)
@@ -96,8 +150,9 @@ class LiberoMemoryBuffer:
         valid = np.zeros((self.recent_records,), dtype=np.bool_)
         source_indices = np.full((self.recent_records,), -1, dtype=np.int64)
 
-        first_slot = self.recent_records - len(self.records)
-        for slot, record in enumerate(self.records, start=first_slot):
+        recent = self._recent_records()
+        first_slot = self.recent_records - len(recent)
+        for slot, record in enumerate(recent, start=first_slot):
             source_step = int(record["source_step"])
             if source_step >= current_step:
                 raise ValueError(
