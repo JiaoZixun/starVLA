@@ -45,6 +45,118 @@ class WaypointDecoderBlock(nn.Module):
         return queries + self.ffn(self.ffn_norm(queries))
 
 
+class CausalExecutionMemory(nn.Module):
+    """Encode strictly-past records and retrieve them for action queries.
+
+    The visual input is a compact uint8 patch sidecar rather than a second
+    Qwen call.  Eight trainable recurrent slots summarize older records; the
+    recent records remain individually addressable.  ``detach_every`` bounds
+    the history graph and does not change the chronological order.
+    """
+
+    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, slots: int = 8, layers: int = 2, detach_every: int = 8, record_dropout: float = 0.0):
+        super().__init__()
+        self.width = int(width)
+        self.slots = int(slots)
+        self.detach_every = max(1, int(detach_every))
+        self.record_dropout = float(record_dropout)
+        self.visual_projection = nn.Sequential(
+            nn.LayerNorm(2 * 8 * 8 * 8 * 3),
+            nn.Linear(2 * 8 * 8 * 8 * 3, width),
+            nn.GELU(),
+            nn.Linear(width, width),
+        )
+        self.record_projection = nn.Sequential(
+            nn.Linear(8 + 7 + 16 + 1, width), nn.GELU(), nn.Linear(width, width)
+        )
+        self.record_norm = nn.LayerNorm(width)
+        # Slot-specific seeds prevent the long-term slots from collapsing to
+        # identical states when every slot receives the same record input.
+        self.slot_seed = nn.Parameter(torch.empty(slots, width))
+        nn.init.normal_(self.slot_seed, mean=0.0, std=0.02)
+        self.slot_update = nn.GRUCell(width, width)
+        self.retrieval_query = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
+        self.retrieval_layers = nn.ModuleList(
+            [nn.MultiheadAttention(width, heads, batch_first=True) for _ in range(layers)]
+        )
+        self.retrieval_norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(layers)])
+        self.output_projection = nn.Linear(width, vlm_width)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(vlm_width + width + 1),
+            nn.Linear(vlm_width + width + 1, width),
+            nn.Sigmoid(),
+        )
+        # Keep the original OFT action path intact at the insertion point.
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def _record_features(self, records: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        patches = torch.as_tensor(records["visual_tokens"], device=device)
+        if patches.ndim != 7:
+            raise ValueError(f"memory_records.visual_tokens must be [B,R,V,T,8,8,3], got {tuple(patches.shape)}")
+        # One ordered vector per record preserves both camera and 2x4 spatial layout.
+        expected_tail = (2, 8, 8, 8, 3)
+        if tuple(patches.shape[-5:]) != expected_tail:
+            raise ValueError(f"Expected memory visual tail {expected_tail}, got {tuple(patches.shape[-5:])}")
+        visual = self.visual_projection(patches.float().div(255.0).flatten(start_dim=2))
+        state = torch.as_tensor(records["state"], device=device, dtype=torch.float32)
+        action = torch.as_tensor(records["executed_actions"], device=device, dtype=torch.float32)
+        pose = torch.as_tensor(records["eef_pose"], device=device, dtype=torch.float32).flatten(-2)
+        elapsed = torch.as_tensor(records["elapsed_env_steps"], device=device, dtype=torch.float32).unsqueeze(-1)
+        record_values = torch.cat((state, action, pose, elapsed), dim=-1)
+        record = self.record_projection(record_values)
+        record = self.record_norm(record + visual)
+        valid = torch.as_tensor(records["valid_mask"], device=device, dtype=torch.bool)
+        return record, valid
+
+    def forward(self, action_queries: torch.Tensor, records: dict | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, _, vlm_width = action_queries.shape
+        if records is None:
+            memory_tokens = action_queries.new_zeros((batch, 1, self.width))
+            memory_valid = torch.zeros((batch, 1), device=action_queries.device, dtype=torch.bool)
+            return (
+                action_queries,
+                memory_tokens,
+                memory_valid,
+                action_queries.new_zeros((batch, vlm_width)),
+                action_queries.new_zeros((batch, self.width)),
+                action_queries.new_zeros(()),
+            )
+        record, valid = self._record_features(records, action_queries.device)
+        if record.shape[0] != batch:
+            raise ValueError(f"Memory batch mismatch: records={record.shape[0]} queries={batch}")
+        if self.training and self.record_dropout > 0:
+            keep = torch.rand(valid.shape, device=valid.device) >= self.record_dropout
+            valid = valid & keep
+        # Recurrently update slots in chronological order. Invalid padding is
+        # skipped. Detaching every eight records is the BPTT truncation rule.
+        slots = self.slot_seed.unsqueeze(0).expand(batch, -1, -1)
+        for index in range(record.shape[1]):
+            active = valid[:, index].to(record.dtype).unsqueeze(-1)
+            slot_input = record[:, index].unsqueeze(1).expand(-1, self.slots, -1).reshape(-1, self.width)
+            updated = self.slot_update(slot_input, slots.reshape(-1, self.width)).view(batch, self.slots, self.width)
+            slots = torch.where(active.unsqueeze(1).bool(), updated, slots)
+            if (index + 1) % self.detach_every == 0:
+                slots = slots.detach()
+        # Retrieval keys are recent records followed by long-term slots.
+        retrieval = torch.cat((record, slots), dim=1)
+        retrieval_valid = torch.cat(
+            (valid, torch.ones((batch, self.slots), device=valid.device, dtype=torch.bool)), dim=1
+        )
+        query = self.retrieval_query(action_queries)
+        padding = ~retrieval_valid
+        for attention, norm in zip(self.retrieval_layers, self.retrieval_norms):
+            update, _ = attention(query, retrieval, retrieval, key_padding_mask=padding, need_weights=False)
+            query = norm(query + update)
+        summary = query.mean(dim=1)
+        elapsed_summary = torch.as_tensor(records["elapsed_env_steps"], device=action_queries.device, dtype=torch.float32)
+        elapsed_summary = (elapsed_summary * valid.float()).sum(dim=1, keepdim=True) / valid.float().sum(dim=1, keepdim=True).clamp_min(1.0)
+        gate_input = torch.cat((action_queries, summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1), elapsed_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1)), dim=-1)
+        gates = self.gate(gate_input)
+        conditioned = action_queries + self.output_projection(gates * query)
+        return conditioned, retrieval, retrieval_valid, summary, gates.mean(dim=1), gates.detach().float().mean()
+
+
 class WaypointModel(nn.Module):
     """Predict relative SE(3) waypoints from task-conditioned action-token features."""
 
@@ -59,10 +171,13 @@ class WaypointModel(nn.Module):
         self.output_norm = nn.LayerNorm(width)
         self.translation_head = nn.Linear(width, 3)
         self.rotation_head = nn.Linear(width, 6)
+        self.gripper_head = nn.Linear(width, 1)
         self.num_waypoints = num_waypoints
         nn.init.zeros_(self.translation_head.weight)
         nn.init.zeros_(self.translation_head.bias)
         nn.init.zeros_(self.rotation_head.weight)
+        nn.init.zeros_(self.gripper_head.weight)
+        nn.init.zeros_(self.gripper_head.bias)
         with torch.no_grad():
             self.rotation_head.bias.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
@@ -72,7 +187,7 @@ class WaypointModel(nn.Module):
         anchor_pose: torch.Tensor,
         tau: torch.Tensor,
         memory_attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = vlm_features.shape[0]
         rotation_6d = matrix_to_rotation_6d(anchor_pose[..., :3, :3])
         anchor_features = torch.cat((anchor_pose[..., :3, 3].float(), rotation_6d), dim=-1)
@@ -89,7 +204,8 @@ class WaypointModel(nn.Module):
         features = self.output_norm(query)
         translation = self.translation_head(features)
         rotation = self.rotation_head(features)
-        return translation, rotation
+        gripper = self.gripper_head(features).squeeze(-1)
+        return translation, rotation, gripper
 
 
 class SpatialAdapter(nn.Module):
@@ -98,8 +214,13 @@ class SpatialAdapter(nn.Module):
     def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4):
         super().__init__()
         self.action_projection = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
-        self.spatial_projection = nn.Sequential(nn.Linear(11, width), nn.GELU(), nn.Linear(width, width))
+        self.spatial_projection = nn.Sequential(nn.Linear(12, width), nn.GELU(), nn.Linear(width, width))
         self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.spatial_gate = nn.Sequential(
+            nn.LayerNorm(vlm_width + width),
+            nn.Linear(vlm_width + width, width),
+            nn.Sigmoid(),
+        )
         self.output_projection = nn.Linear(width, vlm_width)
         self.num_waypoints = num_waypoints
         nn.init.zeros_(self.output_projection.weight)
@@ -110,18 +231,23 @@ class SpatialAdapter(nn.Module):
         action_features: torch.Tensor,
         translation: torch.Tensor,
         rotation_6d: torch.Tensor,
+        gripper: torch.Tensor,
         tau: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = action_features.shape[0]
         normalized_time = tau.float().view(1, -1, 1).expand(batch_size, -1, -1)
         arm_id = torch.zeros_like(normalized_time)
         # The token includes predicted metric coordinates. It does not use future labels or decoder-only latents.
-        token_values = torch.cat((translation.float() / 0.1, rotation_6d.float(), normalized_time, arm_id), dim=-1)
+        token_values = torch.cat(
+            (translation.float() / 0.1, rotation_6d.float(), gripper.float().unsqueeze(-1), normalized_time, arm_id),
+            dim=-1,
+        )
         queries = self.action_projection(action_features)
         keys = self.spatial_projection(token_values)
         update, _ = self.cross_attention(queries, keys, keys, need_weights=False)
-        residual = self.output_projection(update)
-        return action_features + residual, residual
+        gates = self.spatial_gate(torch.cat((action_features, update), dim=-1))
+        residual = self.output_projection(gates * update)
+        return action_features + residual, residual, gates.detach().float().mean()
 
 
 @dataclass
@@ -135,9 +261,10 @@ class QwenSpatialOFTDefaultConfig:
             "heads": 4,
             "ffn_width": 1024,
             "layers": 2,
-            "tau": [1, 2, 4, 8],
+            "tau": [1, 4, 8, 16],
             "waypoint_weight": 1.0,
             "waypoint_rotation_weight": 0.25,
+            "gripper_weight": 0.10,
             "action_geometry_weight": 0.0,
         }
     )
@@ -150,11 +277,11 @@ class QwenSpatialOFT(Qwenvl_OFT):
     def __init__(self, config=None, **kwargs):
         super().__init__(config=config, **kwargs)
         spatial = self.config.framework.get("spatial", {})
-        self.waypoint_tau = tuple(int(value) for value in spatial.get("tau", [1, 2, 4, 8]))
+        self.waypoint_tau = tuple(int(value) for value in spatial.get("tau", [1, 4, 8, 16]))
         if not self.waypoint_tau or tuple(sorted(set(self.waypoint_tau))) != self.waypoint_tau:
             raise ValueError(f"spatial.tau must be a non-empty, strictly increasing list; got {self.waypoint_tau}")
-        if self.waypoint_tau[0] < 1 or self.waypoint_tau[-1] > self.action_horizon:
-            raise ValueError(f"spatial.tau={self.waypoint_tau} must be in [1, action_horizon={self.action_horizon}]")
+        if self.waypoint_tau[0] < 1:
+            raise ValueError(f"spatial.tau={self.waypoint_tau} must be positive")
         self.spatial_width = int(spatial.get("width", 256))
         heads = int(spatial.get("heads", 4))
         ffn_width = int(spatial.get("ffn_width", 1024))
@@ -164,6 +291,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         self.spatial_adapter = SpatialAdapter(hidden_size, self.spatial_width, heads, len(self.waypoint_tau))
         self.waypoint_weight = float(spatial.get("waypoint_weight", 1.0))
         self.waypoint_rotation_weight = float(spatial.get("waypoint_rotation_weight", 0.25))
+        self.gripper_weight = float(spatial.get("gripper_weight", 0.10))
         self.action_geometry_weight = float(spatial.get("action_geometry_weight", 0.0))
         if self.action_geometry_weight != 0.0:
             raise NotImplementedError(
@@ -205,10 +333,34 @@ class QwenSpatialOFT(Qwenvl_OFT):
             values.append(pose)
         return torch.as_tensor(np.stack(values), device=device, dtype=torch.float32)
 
+    def _condition_action_queries(
+        self,
+        examples: list[dict],
+        action_queries: torch.Tensor,
+        translation: torch.Tensor,
+        rotation_6d: torch.Tensor,
+        gripper: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        conditioned, residual, spatial_gate = self.spatial_adapter(
+            action_queries, translation, rotation_6d, gripper, tau
+        )
+        return conditioned, residual, {"spatial_gate_mean": spatial_gate}
+
+    def _condition_memory(
+        self,
+        examples: list[dict],
+        last_hidden: torch.Tensor,
+        action_queries: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Hook for memory-enabled variants; base Spatial OFT stays unchanged."""
+        return last_hidden, action_queries, attention_mask, {}
+
     def _predict_from_features(self, examples: list[dict], qwen_inputs: dict, last_hidden: torch.Tensor, *, train: bool):
         device = last_hidden.device
         anchor_pose = self._batch_geometry_current(examples, device)
-        tau = torch.tensor(self.waypoint_tau, device=device, dtype=torch.float32) / float(self.action_horizon)
+        tau = torch.tensor(self.waypoint_tau, device=device, dtype=torch.float32) / float(max(self.waypoint_tau))
         # Keep the OFT action queries for the original action head and adapter, while the
         # waypoint decoder attends to the full task-conditioned VLM sequence as specified
         # by the spatial architecture. This reuses the existing VLM forward without a
@@ -224,17 +376,22 @@ class QwenSpatialOFT(Qwenvl_OFT):
                 "Qwen attention mask must align with the full VLM hidden sequence: "
                 f"mask={tuple(memory_attention_mask.shape)}, hidden={tuple(last_hidden.shape[:2])}"
             )
+        waypoint_features, action_queries, memory_attention_mask, memory_metrics = self._condition_memory(
+            examples, last_hidden, action_queries, memory_attention_mask
+        )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            translation, rotation_6d = self.waypoint_model(
-                last_hidden,
+            translation, rotation_6d, waypoint_gripper = self.waypoint_model(
+                waypoint_features,
                 anchor_pose,
                 tau,
                 memory_attention_mask,
             )
-            conditioned_queries, spatial_residual = self.spatial_adapter(
+            conditioned_queries, spatial_residual, extra_metrics = self._condition_action_queries(
+                examples,
                 action_queries,
                 translation,
                 rotation_6d,
+                waypoint_gripper,
                 tau,
             )
             pred_actions = self.action_model.predict_action(conditioned_queries)
@@ -242,7 +399,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         waypoint_prediction[..., :3, :3] = rotation_6d_to_matrix(rotation_6d)
         waypoint_prediction[..., :3, 3] = translation.float()
         if not train:
-            return pred_actions, waypoint_prediction, spatial_residual
+            return pred_actions, waypoint_prediction, spatial_residual, {**memory_metrics, **extra_metrics}
 
         actions = torch.as_tensor(np.stack([example["action"] for example in examples]), device=device, dtype=pred_actions.dtype)
         actions_target = actions[:, -self.action_horizon :, :]
@@ -270,9 +427,29 @@ class QwenSpatialOFT(Qwenvl_OFT):
             )
         translation_loss, rotation_loss = relative_pose_loss(waypoint_prediction, target_pose, future_valid)
         waypoint_loss = translation_loss + self.waypoint_rotation_weight * rotation_loss
+        gripper_target = torch.as_tensor(
+            np.stack([label["future_gripper"] for label in labels]), device=device, dtype=waypoint_gripper.dtype
+        )
+        gripper_valid = torch.as_tensor(
+            np.stack([label["future_gripper_valid"] for label in labels]), device=device, dtype=torch.bool
+        )
+        if gripper_target.shape != waypoint_gripper.shape or gripper_valid.shape != waypoint_gripper.shape:
+            raise ValueError(
+                f"Invalid future gripper labels: target={tuple(gripper_target.shape)}, "
+                f"mask={tuple(gripper_valid.shape)}, prediction={tuple(waypoint_gripper.shape)}"
+            )
+        if torch.any(gripper_valid):
+            gripper_loss = torch.abs(waypoint_gripper.float() - gripper_target.float())[gripper_valid].mean()
+        else:
+            gripper_loss = bc_loss.new_zeros(())
         relation_loss = bc_loss.new_zeros(())
         action_geometry_loss = bc_loss.new_zeros(())
-        total_loss = bc_loss + self.waypoint_weight * waypoint_loss + self.action_geometry_weight * action_geometry_loss
+        auxiliary_loss = (
+            self.waypoint_weight * waypoint_loss
+            + self.gripper_weight * gripper_loss
+            + self.action_geometry_weight * action_geometry_loss
+        )
+        total_loss = bc_loss + auxiliary_loss
         residual_ratio = spatial_residual.detach().float().square().mean().sqrt() / (
             action_queries.detach().float().square().mean().sqrt() + 1e-8
         )
@@ -283,9 +460,13 @@ class QwenSpatialOFT(Qwenvl_OFT):
             "waypoint_loss": waypoint_loss,
             "waypoint_translation_loss": translation_loss,
             "waypoint_rotation_loss": rotation_loss,
+            "gripper_loss": gripper_loss,
+            "auxiliary_loss": auxiliary_loss,
             "relation_loss": relation_loss,
             "action_geometry_loss": action_geometry_loss,
             "spatial_residual_ratio": residual_ratio,
+            **memory_metrics,
+            **extra_metrics,
         }
 
     def forward(self, examples: list[dict] = None, **kwargs):
@@ -297,7 +478,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         if type(examples) is not list:
             examples = [examples]
         qwen_inputs, last_hidden = self._build_inputs(examples)
-        pred_actions, _, _ = self._predict_from_features(examples, qwen_inputs, last_hidden, train=False)
+        pred_actions, _, _, _ = self._predict_from_features(examples, qwen_inputs, last_hidden, train=False)
         return {"normalized_actions": pred_actions.detach().float().cpu().numpy()}
 
 

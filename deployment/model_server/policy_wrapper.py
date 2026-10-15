@@ -150,7 +150,16 @@ class PolicyServerWrapper:
                 "Eval clients must explicitly choose image count and order. "
                 "The server does not infer or reorder camera views from training config."
             ),
+            "memory_enabled": hasattr(self._framework, "memory_encoder"),
         }
+        if base["memory_enabled"]:
+            base["memory_contract"] = {
+                "recent_records": int(self._framework.memory_recent_records),
+                "decision_stride_env_steps": int(self._framework.memory_decision_stride),
+                "visual_views": 2,
+                "visual_grid_size": 8,
+                "visual_feature_dim": 3,
+            }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
             proc = self._get_processor(self._default_unnorm_key)

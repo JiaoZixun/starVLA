@@ -286,9 +286,20 @@ class TrainerUtils:
                     prefix = path + "."
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
-                        module.load_state_dict(sub_state_dict, strict=True)
+                        # Spatial/memory heads intentionally evolve while the
+                        # Qwen/OFT checkpoint remains reusable.  Keep only
+                        # keys with identical shapes and report skipped keys.
+                        current_state = module.state_dict()
+                        compatible = {
+                            key: value
+                            for key, value in sub_state_dict.items()
+                            if key in current_state and tuple(current_state[key].shape) == tuple(value.shape)
+                        }
+                        skipped = sorted(set(sub_state_dict) - set(compatible))
+                        module.load_state_dict(compatible, strict=False)
                         if _dist_rank() == 0:
-                            print(f"✅ parameters loaded to module '{path}'")
+                            suffix = f"; skipped {len(skipped)} incompatible keys" if skipped else ""
+                            print(f"✅ parameters loaded to module '{path}' ({len(compatible)} keys){suffix}")
                         loaded_modules.append(path)
                     else:
                         print(f"⚠️ parameters not found in checkpoint '{path}'")

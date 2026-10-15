@@ -21,6 +21,7 @@ from libero.libero.envs import OffScreenRenderEnv
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.tools import read_mode_config
 from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
+from starVLA.dataloader.libero_memory import LiberoMemoryBuffer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
@@ -159,6 +160,7 @@ class PolicyModel:
         if use_bf16:  # False
             vla = vla.to(torch.bfloat16)
         self.vla = vla.to("cuda").eval()
+        self.memory_enabled = hasattr(self.vla, "memory_encoder")
 
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
         self.use_ddim = use_ddim
@@ -183,6 +185,18 @@ class PolicyModel:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        self.memory_buffer = (
+            LiberoMemoryBuffer(
+                recent_records=int(self.vla.memory_recent_records),
+                decision_stride=int(self.vla.memory_decision_stride),
+            )
+            if self.memory_enabled
+            else None
+        )
+        if self.memory_buffer is not None and self.memory_buffer.decision_stride != self.action_chunk_size:
+            raise ValueError("Memory decision stride must equal the LIBERO action chunk size")
+        self._pending_memory_example = None
+        self._pending_memory_step = None
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
@@ -199,6 +213,10 @@ class PolicyModel:
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
+        if self.memory_buffer is not None:
+            self.memory_buffer.reset()
+        self._pending_memory_example = None
+        self._pending_memory_step = None
 
     def step(self, example: dict, step: int = 0, **kwargs) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
@@ -210,6 +228,7 @@ class PolicyModel:
 
         task_description = example.get("lang", None)
         images = example["image"]  # list of images for history
+        memory_source_images = images
 
         if example is not None:
             if task_description != self.task_description:
@@ -226,6 +245,17 @@ class PolicyModel:
 
         action_chunk_size = self.action_chunk_size
         if step % action_chunk_size == 0:
+            if self.memory_buffer is not None:
+                example = {
+                    **example,
+                    "memory_records": self.memory_buffer.build(step),
+                    "memory_contract": {
+                        "history_is_strictly_past": True,
+                        "decision_stride_env_steps": self.memory_buffer.decision_stride,
+                        "recent_records": self.memory_buffer.recent_records,
+                        "source_frame_index": int(step),
+                    },
+                }
             response = self.vla.predict_action(example, **vla_input)
             normalized_actions = response["normalized_actions"]  # B, chunk, D
 
@@ -237,6 +267,10 @@ class PolicyModel:
             self.raw_actions = self.unnormalize_actions(
                 normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats
             )
+            if self.memory_buffer is not None:
+                memory_example = {**example, "image": memory_source_images}
+                self._pending_memory_example = memory_example
+                self._pending_memory_step = int(step)
 
         raw_actions = self.raw_actions[step % action_chunk_size][None]
 
@@ -247,6 +281,18 @@ class PolicyModel:
         }
 
         return {"raw_action": raw_action}
+
+    def record_executed_action(self, executed_action: np.ndarray, step: int) -> None:
+        """Commit the action actually accepted by the environment."""
+        if self.memory_buffer is None:
+            return
+        if self._pending_memory_example is None and int(step) % self.action_chunk_size != 0:
+            return
+        if self._pending_memory_example is None or self._pending_memory_step != int(step):
+            raise RuntimeError(f"No pending policy decision for executed step {step}")
+        self.memory_buffer.append(self._pending_memory_example, np.asarray(executed_action, dtype=np.float32), int(step))
+        self._pending_memory_example = None
+        self._pending_memory_step = None
 
     @staticmethod
     def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
@@ -487,6 +533,7 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    "memory_state": state.astype(np.float32),
                     # SpatialOFT needs the measured EEF pose as its geometry anchor.
                     "geometry_current": {
                         "eef_pose": pose_from_position_axis_angle(state[:3], state[3:6]),
@@ -528,6 +575,7 @@ def eval_libero(args: Args) -> None:
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
                 obs, reward, done, info = env.step(delta_action.tolist())
+                client_model.record_executed_action(delta_action, step)
                 if done:
                     task_successes += 1
                     total_successes += 1

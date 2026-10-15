@@ -13,7 +13,7 @@ from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
 class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
     """Attach geometry labels by (dataset, revision, episode, frame) only."""
 
-    def __init__(self, *args, geometry_sidecar_root: str | Path, waypoint_tau=(1, 2, 4, 8), **kwargs):
+    def __init__(self, *args, geometry_sidecar_root: str | Path, waypoint_tau=(1, 4, 8, 16), **kwargs):
         super().__init__(*args, **kwargs)
         self.waypoint_tau = tuple(int(value) for value in waypoint_tau)
         if not self.waypoint_tau or min(self.waypoint_tau) < 1 or tuple(sorted(set(self.waypoint_tau))) != self.waypoint_tau:
@@ -108,6 +108,9 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
         future_indices = [frame_index + tau for tau in self.waypoint_tau]
         future_valid = np.asarray([index < episode_length for index in future_indices], dtype=np.bool_)
         future = np.broadcast_to(np.eye(4, dtype=np.float32), (len(self.waypoint_tau), 4, 4)).copy()
+        current_state = None
+        if self.curr_traj_data is not None and "observation.state" in self.curr_traj_data.columns:
+            current_state = np.asarray(self.curr_traj_data.iloc[frame_index]["observation.state"], dtype=np.float32)
         future_gripper = np.zeros((len(self.waypoint_tau),), dtype=np.float32)
         future_gripper_valid = future_valid.copy()
         # ``observation.state`` is read only for supervision.  It is never
@@ -136,6 +139,7 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
 
         sample["geometry_current"] = {
             "eef_pose": current,
+            "gripper_state": float(current_state[7]) if current_state is not None and current_state.shape == (8,) else 0.0,
             "arm_mask": np.asarray([True], dtype=np.bool_),
         }
         sample["geometry_labels"] = {

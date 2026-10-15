@@ -22,7 +22,7 @@ framework:
     heads: 4
     ffn_width: 1024
     layers: 2
-    tau: [1, 2, 4, 8]
+    tau: [1, 4, 8, 16]
     waypoint_weight: 1.0
     waypoint_rotation_weight: 0.25
     # Keep disabled until an action-row/pre-action pose phase contract is proven.
@@ -34,7 +34,7 @@ datasets:
     data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
     data_mix: libero_spatial_oft_all
     geometry_sidecar_root: playground/DerivedData/libero_spatial_oft_v1
-    waypoint_tau: [1, 2, 4, 8]
+    waypoint_tau: [1, 4, 8, 16]
     per_device_batch_size: 32
     num_workers: 8
     pin_memory: true

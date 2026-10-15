@@ -180,6 +180,7 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    "memory_state": state.astype(np.float32),
                     # QwenSpatialOFT uses the measured EEF pose as its current
                     # geometry anchor. Baseline QwenOFT simply ignores this field.
                     "geometry_current": {
@@ -222,6 +223,8 @@ def eval_libero(args: Args) -> None:
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
                 obs, reward, done, info = env.step(delta_action.tolist())
+                if hasattr(client_model, "record_executed_action"):
+                    client_model.record_executed_action(delta_action, step)
                 if done:
                     task_successes += 1
                     total_successes += 1

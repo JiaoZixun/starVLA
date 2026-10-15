@@ -5,6 +5,7 @@ from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTran
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 from starVLA.dataloader.geometry_lerobot_dataset import SpatialLeRobotSingleDataset
+from starVLA.dataloader.memory_lerobot_dataset import MemoryLeRobotSingleDataset
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +111,31 @@ class SpatialLibero4in1DataConfig(Libero4in1DataConfig):
         return SpatialLeRobotSingleDataset(
             **kwargs,
             geometry_sidecar_root=sidecar_root,
-            waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 2, 4, 8])),
+            waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 4, 8, 16])),
+        )
+
+
+class MemoryLibero4in1DataConfig(SpatialLibero4in1DataConfig):
+    """Spatial LIBERO config with an external, strictly causal memory sidecar."""
+
+    def make_dataset(self, **kwargs):
+        data_cfg = kwargs.get("data_cfg")
+        if data_cfg is None:
+            raise ValueError("Memory LIBERO training requires datasets.vla_data.memory_sidecar_root")
+        geometry_root = data_cfg.get("geometry_sidecar_root")
+        memory_root = data_cfg.get("memory_sidecar_root")
+        if not geometry_root or not memory_root:
+            raise ValueError("Memory LIBERO training requires both geometry and memory sidecar roots")
+        return MemoryLeRobotSingleDataset(
+            **kwargs,
+            geometry_sidecar_root=geometry_root,
+            memory_sidecar_root=memory_root,
+            waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 4, 8, 16])),
+            memory_recent_records=int(data_cfg.get("memory_recent_records", 32)),
+            memory_decision_stride=int(data_cfg.get("memory_decision_stride_env_steps", 8)),
+            memory_visual_tokens=int(data_cfg.get("memory_visual_tokens", 8)),
+            memory_bptt_records=int(data_cfg.get("memory_bptt_records", 8)),
+            memory_dropout=float(data_cfg.get("memory_dropout", 0.0)),
         )
 
 
@@ -118,6 +143,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
     "openpi_libero_franka": OpenPILibero4in1DataConfig(),
     "libero_spatial_oft_franka": SpatialLibero4in1DataConfig(),
+    "libero_spatial_mem_oft_franka": MemoryLibero4in1DataConfig(),
 }
 
 
@@ -152,6 +178,12 @@ DATASET_NAMED_MIXTURES = {
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+    ],
+    "libero_spatial_mem_oft_all": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
     ],
     "libero_goal": [
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),

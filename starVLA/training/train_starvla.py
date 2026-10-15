@@ -429,7 +429,51 @@ class VLATrainer(TrainerUtils):
                 if not torch.is_tensor(total_loss):
                     raise TypeError(f"Model total_loss must be a tensor, got {type(total_loss).__name__}")
 
-            self.accelerator.backward(total_loss)
+            use_bc_projection = bool(
+                getattr(self.config.trainer, "bc_priority_gradient_projection", False)
+            )
+            projection_metrics = {}
+            if use_bc_projection:
+                trainable = [param for param in self.model.parameters() if param.requires_grad]
+                bc_loss = output_dict.get("bc_loss", action_loss)
+                auxiliary_loss = output_dict.get("auxiliary_loss", total_loss - bc_loss)
+                bc_grads = torch.autograd.grad(
+                    bc_loss, trainable, retain_graph=True, allow_unused=True
+                )
+                aux_grads = torch.autograd.grad(
+                    auxiliary_loss, trainable, retain_graph=False, allow_unused=True
+                )
+                dot = torch.zeros((), device=total_loss.device, dtype=torch.float32)
+                bc_norm_sq = torch.zeros_like(dot)
+                aux_norm_sq = torch.zeros_like(dot)
+                for bc_grad, aux_grad in zip(bc_grads, aux_grads):
+                    if bc_grad is not None:
+                        bc_float = bc_grad.float()
+                        bc_norm_sq = bc_norm_sq + bc_float.square().sum()
+                    if aux_grad is not None:
+                        aux_float = aux_grad.float()
+                        aux_norm_sq = aux_norm_sq + aux_float.square().sum()
+                    if bc_grad is not None and aux_grad is not None:
+                        dot = dot + (bc_grad.float() * aux_grad.float()).sum()
+                conflict = dot < 0
+                denominator = bc_norm_sq.clamp_min(1e-12)
+                coefficient = torch.where(conflict, dot / denominator, torch.zeros_like(dot))
+                for param, bc_grad, aux_grad in zip(trainable, bc_grads, aux_grads):
+                    if bc_grad is None and aux_grad is None:
+                        param.grad = None
+                        continue
+                    bc_value = torch.zeros_like(param) if bc_grad is None else bc_grad
+                    aux_value = torch.zeros_like(param) if aux_grad is None else aux_grad
+                    param.grad = bc_value + aux_value - coefficient.to(aux_value.dtype) * bc_value
+                cosine = dot / (bc_norm_sq.sqrt() * aux_norm_sq.sqrt()).clamp_min(1e-12)
+                projection_metrics = {
+                    "gradient_bc_aux_cosine": cosine.detach(),
+                    "gradient_bc_norm": bc_norm_sq.sqrt().detach(),
+                    "gradient_aux_norm": aux_norm_sq.sqrt().detach(),
+                    "gradient_conflict": conflict.float().detach(),
+                }
+            else:
+                self.accelerator.backward(total_loss)
 
             if self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
@@ -448,13 +492,19 @@ class VLATrainer(TrainerUtils):
             "waypoint_loss",
             "waypoint_translation_loss",
             "waypoint_rotation_loss",
+            "gripper_loss",
+            "auxiliary_loss",
+            "effect_loss",
             "relation_loss",
             "action_geometry_loss",
             "spatial_residual_ratio",
+            "memory_gate_mean",
         ):
             value = output_dict.get(key)
             if torch.is_tensor(value):
                 metrics[key] = value.detach().item()
+        for key, value in projection_metrics.items():
+            metrics[key] = value.item() if torch.is_tensor(value) else float(value)
         return metrics
 
     def _finalize_training(self):
