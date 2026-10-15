@@ -46,7 +46,9 @@ export PYTHONWARNINGS="ignore"
 # LIBERO/MuJoCo must use NVIDIA hardware rendering through EGL.
 export MUJOCO_GL="egl"
 export PYOPENGL_PLATFORM="egl"
-export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
+NVIDIA_EGL_VENDOR_JSON="${NVIDIA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
+[[ -r "${NVIDIA_EGL_VENDOR_JSON}" ]] || fail "NVIDIA EGL vendor file is not readable: ${NVIDIA_EGL_VENDOR_JSON}"
+export __EGL_VENDOR_LIBRARY_FILENAMES="${NVIDIA_EGL_VENDOR_JSON}"
 export MUJOCO_EGL_DEVICE_ID="${GPU_ID}"
 export STARVLA_DISABLE_DEEPSPEED=1
 export TOKENIZERS_PARALLELISM=false
@@ -54,6 +56,8 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONPATH="${STARVLA_DIR}:${PYTHONPATH:-}"
+
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON}" examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py
 
 "${PYTHON}" - <<'PY'
 from packaging.version import Version

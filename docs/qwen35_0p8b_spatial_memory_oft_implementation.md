@@ -1,6 +1,6 @@
 # Qwen3.5-0.8B Spatial-Memory OFT
 
-状态：代码和数据 sidecar 已完成，CUDA/EGL 验证和训练留待明天执行。
+状态：代码和数据 sidecar 已完成。今天的训练日志显示 Stage A 曾在 CUDA0 运行到 3,970/5,000 步后停止；没有 5,000 步 checkpoint，当前也没有活动训练进程，因此该阶段明天需要从 spatial checkpoint 重新运行。尚未完成独立的 NVIDIA EGL renderer 验证。
 
 当前分支从 `spatial` 切出为 `libero-0.8B-spatial-mem`。模型保留 Qwen3.5-0.8B 和原 OFT action head，单次 Qwen 前向得到当前视觉语言 hidden states 和 action queries。新增的 memory encoder 不重新调用 Qwen，因此因果历史不会把 Qwen 前向次数扩大为 8 倍。
 
@@ -40,12 +40,12 @@ GPU_ID=0 STAGE=all WANDB_MODE=disabled \
 bash examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh
 ```
 
-明天 CUDA 验证后再根据稳定的单步时间估算 50K 步总时长。此前同卡空间 OFT 参考约 1.1 秒/步，50,000 步约 15.3 小时；memory sidecar 的预处理不占训练 GPU 时间，实际 ETA 以 CUDA0 的吞吐测量为准。
+本次 Stage A 日志测得约 0.66 秒/步（3,970 步约 43 分 35 秒），但该阶段冻结了 Qwen 和原 action path，不能直接代表全量训练速度。此前空间 OFT 全量训练约 1.1 秒/步；按 Stage A 约 55 分钟、Stage B 剩余 45,000 步约 13.8 小时估算，从头完成两阶段约 14.7 小时，建议预留 15–16 小时。明天完成独立 CUDA/EGL 检查后，以前 100–500 个全量训练步重新确认 ETA。memory sidecar 预处理不占训练 GPU 时间。
 
 ## 验证清单
 
 1. 在 `fastvla-fla` 环境执行四个 sidecar 的 `--verify`，确认源 revision、frame map、SHA256 和 fallback 帧数。
 2. 执行 Python 编译检查和 `git diff --check`。
-3. 明天启动长训练前设置单卡 `CUDA_VISIBLE_DEVICES=0`，并完成 AGENTS.md 要求的 NVIDIA EGL 检查。
+3. 明天启动长训练前设置单卡 `CUDA_VISIBLE_DEVICES=0`，完成 `nvidia-smi` 与 `check_nvidia_egl.py` 验证；训练脚本现在会在开始长跑前自动检查 NVIDIA EGL renderer。
 4. 训练期间监控 BC、waypoint、gripper、memory/spatial gate 分布以及 BC/aux 梯度夹角；gate 长期接近零时不能仅凭总 loss 判断模块有效。
 5. 训练结束后使用相同 LIBERO suite、seed 和 episode 协议评估，并与 spatial OFT checkpoint 对照；在完成评估前不宣称成功率提升。
