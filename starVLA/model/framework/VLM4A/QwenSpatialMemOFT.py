@@ -104,20 +104,6 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         keys = ("visual_tokens", "state", "executed_actions", "eef_pose", "elapsed_env_steps", "valid_mask")
         return {key: np.stack([np.asarray(record[key]) for record in records]) for key in keys}
 
-    def _condition_action_queries(
-        self,
-        examples: list[dict],
-        action_queries: torch.Tensor,
-        translation: torch.Tensor,
-        rotation_6d: torch.Tensor,
-        gripper: torch.Tensor,
-        tau: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        conditioned, spatial_residual, spatial_gate = self.spatial_adapter(
-            action_queries, translation, rotation_6d, gripper, tau
-        )
-        return conditioned, spatial_residual, {"spatial_gate_mean": spatial_gate}
-
     def _condition_memory(
         self,
         examples: list[dict],
