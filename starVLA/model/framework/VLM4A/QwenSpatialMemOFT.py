@@ -9,6 +9,7 @@ are translated into the shared spatial configuration here.
 from __future__ import annotations
 
 import numpy as np
+import torch
 import torch.nn as nn
 
 from starVLA.model.framework.VLM4A.QwenSpatialOFT import (
