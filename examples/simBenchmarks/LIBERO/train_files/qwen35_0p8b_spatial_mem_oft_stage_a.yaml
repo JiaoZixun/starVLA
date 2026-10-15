@@ -36,6 +36,8 @@ framework:
     visual_views: 2
     visual_tokens: 8
     visual_feature_dim: 3
+    bptt_records: 8
+    effect_weight: 0.0
 
 datasets:
   vla_data:
@@ -48,6 +50,10 @@ datasets:
     memory_recent_records: 32
     memory_decision_stride_env_steps: 8
     memory_visual_tokens: 8
+    memory_bptt_records: 8
+    memory_decision_frame_only: true
+    drop_incomplete_action_chunks: true
+    effect_weight: 0.0
     per_device_batch_size: 32
     num_workers: 8
     pin_memory: true

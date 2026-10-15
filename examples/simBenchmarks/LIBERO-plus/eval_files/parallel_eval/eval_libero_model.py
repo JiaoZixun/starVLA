@@ -575,7 +575,10 @@ def eval_libero(args: Args) -> None:
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
                 obs, reward, done, info = env.step(delta_action.tolist())
-                client_model.record_executed_action(delta_action, step)
+                # Commit only the action that starts a newly requested chunk;
+                # queued chunk actions are not independent memory records.
+                if step % client_model.action_chunk_size == 0:
+                    client_model.record_executed_action(delta_action, step)
                 if done:
                     task_successes += 1
                     total_successes += 1

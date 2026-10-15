@@ -109,7 +109,25 @@ class CausalExecutionMemory(nn.Module):
         valid = torch.as_tensor(records["valid_mask"], device=device, dtype=torch.bool)
         return record, valid
 
-    def forward(self, action_queries: torch.Tensor, records: dict | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _update_slots(
+        self, slots: torch.Tensor, record: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        batch, _, _ = record.shape
+        for index in range(record.shape[1]):
+            active = valid[:, index].view(batch, 1, 1)
+            slot_input = record[:, index].unsqueeze(1).expand(-1, self.slots, -1)
+            updated = self.slot_update(
+                slot_input.reshape(-1, self.width), slots.reshape(-1, self.width)
+            ).view(batch, self.slots, self.width)
+            slots = torch.where(active, updated, slots)
+        return slots
+
+    def forward(
+        self,
+        action_queries: torch.Tensor,
+        records: dict | None,
+        burnin_records: dict | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, _, vlm_width = action_queries.shape
         if records is None:
             memory_tokens = action_queries.new_zeros((batch, 1, self.width))
@@ -120,7 +138,7 @@ class CausalExecutionMemory(nn.Module):
                 memory_valid,
                 action_queries.new_zeros((batch, vlm_width)),
                 action_queries.new_zeros((batch, self.width)),
-                action_queries.new_zeros(()),
+                action_queries.new_zeros((batch, action_queries.shape[1], self.width)),
             )
         record, valid = self._record_features(records, action_queries.device)
         if record.shape[0] != batch:
@@ -128,15 +146,23 @@ class CausalExecutionMemory(nn.Module):
         if self.training and self.record_dropout > 0:
             keep = torch.rand(valid.shape, device=valid.device) >= self.record_dropout
             valid = valid & keep
-        # Recurrently update slots in chronological order. Invalid padding is
-        # skipped. Detaching every eight records is the BPTT truncation rule.
+        # Burn-in reconstructs long-term state from the episode prefix without
+        # retaining its graph. Only the recent window contributes BPTT.
         slots = self.slot_seed.unsqueeze(0).expand(batch, -1, -1)
-        for index in range(record.shape[1]):
-            active = valid[:, index].to(record.dtype).unsqueeze(-1)
-            slot_input = record[:, index].unsqueeze(1).expand(-1, self.slots, -1).reshape(-1, self.width)
-            updated = self.slot_update(slot_input, slots.reshape(-1, self.width)).view(batch, self.slots, self.width)
-            slots = torch.where(active.unsqueeze(1).bool(), updated, slots)
-            if (index + 1) % self.detach_every == 0:
+        if burnin_records is not None and burnin_records["valid_mask"].shape[1] > 0:
+            with torch.no_grad():
+                burnin, burnin_valid = self._record_features(burnin_records, action_queries.device)
+                if self.training and self.record_dropout > 0:
+                    keep = torch.rand(burnin_valid.shape, device=burnin_valid.device) >= self.record_dropout
+                    burnin_valid = burnin_valid & keep
+                slots = self._update_slots(slots, burnin, burnin_valid)
+            slots = slots.detach()
+
+        # Recent records remain differentiable, with periodic graph truncation.
+        for start in range(0, record.shape[1], self.detach_every):
+            stop = min(start + self.detach_every, record.shape[1])
+            slots = self._update_slots(slots, record[:, start:stop], valid[:, start:stop])
+            if stop % self.detach_every == 0:
                 slots = slots.detach()
         # Retrieval keys are recent records followed by long-term slots.
         retrieval = torch.cat((record, slots), dim=1)
@@ -154,7 +180,7 @@ class CausalExecutionMemory(nn.Module):
         gate_input = torch.cat((action_queries, summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1), elapsed_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1)), dim=-1)
         gates = self.gate(gate_input)
         conditioned = action_queries + self.output_projection(gates * query)
-        return conditioned, retrieval, retrieval_valid, summary, gates.mean(dim=1), gates.detach().float().mean()
+        return conditioned, retrieval, retrieval_valid, summary, gates.mean(dim=1), gates.detach()
 
 
 class WaypointModel(nn.Module):
@@ -247,7 +273,7 @@ class SpatialAdapter(nn.Module):
         update, _ = self.cross_attention(queries, keys, keys, need_weights=False)
         gates = self.spatial_gate(torch.cat((action_features, update), dim=-1))
         residual = self.output_projection(gates * update)
-        return action_features + residual, residual, gates.detach().float().mean()
+        return action_features + residual, residual, gates.detach()
 
 
 @dataclass

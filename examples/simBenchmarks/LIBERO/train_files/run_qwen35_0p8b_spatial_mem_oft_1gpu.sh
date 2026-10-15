@@ -41,6 +41,8 @@ cd "${STARVLA_DIR}"
 [[ -d starVLA ]] || fail "STARVLA_DIR is not the repository root: ${STARVLA_DIR}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
+# Suppress Python-level UserWarnings (torchvision deprecations, etc.) from the log.
+export PYTHONWARNINGS="ignore"
 # LIBERO/MuJoCo must use NVIDIA hardware rendering through EGL.
 export MUJOCO_GL="egl"
 export PYOPENGL_PLATFORM="egl"

@@ -214,7 +214,8 @@ class MemoryLeRobotSingleDataset(SpatialLeRobotSingleDataset):
 
     def _memory_burnin_records(self, trajectory_id: int, frame_index: int) -> dict[str, np.ndarray]:
         stride = self.memory_decision_stride
-        indices = np.arange(0, frame_index, stride, dtype=np.int64)
+        recent_start = max(0, frame_index - stride * self.memory_recent_records)
+        indices = np.arange(0, recent_start, stride, dtype=np.int64)
         if indices.size and int(indices[-1]) >= frame_index:
             raise AssertionError("Burn-in may contain only records strictly earlier than the current frame")
         records = [self._memory_record_at(trajectory_id, int(index)) for index in indices]
@@ -228,10 +229,12 @@ class MemoryLeRobotSingleDataset(SpatialLeRobotSingleDataset):
                 "observed_effect": np.zeros((0, 256), dtype=np.float32),
                 "prediction_residual": np.zeros((0, 256), dtype=np.float32),
                 "effect_valid": np.zeros((0,), dtype=np.bool_),
+                "valid_mask": np.zeros((0,), dtype=np.bool_),
                 "source_frame_index": indices,
             }
         return {
             **{key: np.stack([record[key] for record in records]) for key in records[0]},
+            "valid_mask": np.ones((len(records),), dtype=np.bool_),
             "source_frame_index": indices,
         }
 
@@ -241,17 +244,20 @@ class MemoryLeRobotSingleDataset(SpatialLeRobotSingleDataset):
             raise RuntimeError("Memory sample key is unavailable; get_step_data must precede _pack_sample")
         trajectory_id, frame_index = self._memory_active_sample
         records = self._memory_records(trajectory_id, frame_index)
+        burnin = self._memory_burnin_records(trajectory_id, frame_index)
         sample["memory_records"] = records
+        sample["memory_burnin_records"] = burnin
         sample["memory_current_record"] = self._memory_record_at(trajectory_id, frame_index)
-        if self._build_memory_burnin:
-            sample["memory_burnin_records"] = self._memory_burnin_records(trajectory_id, frame_index)
-            self._build_memory_burnin = False
         sample["memory_contract"] = {
             "history_is_strictly_past": True,
             "decision_stride_env_steps": self.memory_decision_stride,
             "recent_records": self.memory_recent_records,
             "bptt_decision_records": self.memory_bptt_records,
             "source_frame_index": int(frame_index),
+            "burnin_records": int(len(burnin["source_frame_index"])),
+            "burnin_before_frame": int(
+                burnin["source_frame_index"][-1] if len(burnin["source_frame_index"]) else -1
+            ),
             "episode_index": int(trajectory_id),
             "effect_targets_enabled": False,
         }

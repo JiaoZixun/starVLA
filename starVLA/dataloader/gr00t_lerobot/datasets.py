@@ -2230,6 +2230,18 @@ class LeRobotMixtureDataset(Dataset):
             if self.data_cfg is not None
             else False
         )
+        self.memory_decision_frame_only = bool(
+            self.data_cfg.get("memory_decision_frame_only", False)
+            if self.data_cfg is not None
+            else False
+        )
+        self.memory_decision_stride = int(
+            self.data_cfg.get("memory_decision_stride_env_steps", 1)
+            if self.data_cfg is not None
+            else 1
+        )
+        if self.memory_decision_stride < 1:
+            raise ValueError("memory_decision_stride_env_steps must be positive")
 
         self._valid_step_bounds: list[tuple[int, int]] = []
         self._effective_trajectory_lengths: list[np.ndarray] = []
@@ -2405,7 +2417,26 @@ class LeRobotMixtureDataset(Dataset):
         if self.drop_incomplete_action_chunks:
             valid_start, end_trim = self._valid_step_bounds[dataset_index]
             valid_end_exclusive = int(dataset.trajectory_lengths[trajectory_index]) - end_trim
-            base_index = int(rng.integers(valid_start, valid_end_exclusive))
+            if self.memory_decision_frame_only:
+                # Align training anchors with evaluator policy requests.  The
+                # history sidecar still stores actual frame numbers, while
+                # this filter prevents arbitrary intra-chunk anchors.
+                aligned_start = valid_start + (
+                    -valid_start % self.memory_decision_stride
+                )
+                decision_count = (
+                    valid_end_exclusive - aligned_start + self.memory_decision_stride - 1
+                ) // self.memory_decision_stride
+                if decision_count <= 0:
+                    raise RuntimeError(
+                        f"Episode {trajectory_id} has no complete stride-aligned action chunk"
+                    )
+                base_index = int(
+                    aligned_start
+                    + rng.integers(decision_count) * self.memory_decision_stride
+                )
+            else:
+                base_index = int(rng.integers(valid_start, valid_end_exclusive))
         else:
             base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
         return dataset, trajectory_id, base_index

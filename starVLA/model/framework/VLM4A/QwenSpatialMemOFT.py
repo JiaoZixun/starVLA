@@ -125,15 +125,43 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         attention_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
         memory_records = self._batch_memory_records(examples)
-        memory_conditioned, _, _, memory_summary, memory_channel_gate, memory_gate = self.execution_memory(
-            action_queries, memory_records
-        )
-        # The same retrieved history conditions waypoint decoding and the
-        # action path.  The projection is zero-initialized so the original
-        # spatial checkpoint remains the optimization starting point.
-        waypoint_features = last_hidden + self.memory_waypoint_projection(memory_summary).unsqueeze(1)
+        burnin_records = []
+        for example in examples:
+            burnin = example.get("memory_burnin_records")
+            if not isinstance(burnin, dict):
+                raise ValueError("QwenSpatialMemOFT requires memory_burnin_records for every example")
+            burnin_records.append(burnin)
+        burnin_keys = tuple(burnin_records[0].keys())
+        if any(tuple(record.keys()) != burnin_keys for record in burnin_records):
+            raise ValueError("Memory burn-in records must have the same fields in every batch example")
+        burnin_lengths = [len(record["valid_mask"]) for record in burnin_records]
+        max_burnin = max(burnin_lengths, default=0)
+        burnin_batch = {}
+        for key in burnin_keys:
+            sample_value = np.asarray(burnin_records[0][key])
+            batched_value = np.zeros(
+                (len(examples), max_burnin, *sample_value.shape[1:]), dtype=sample_value.dtype
+            )
+            for index, (record, length) in enumerate(zip(burnin_records, burnin_lengths)):
+                value = np.asarray(record[key])
+                if value.shape[0] != length or value.shape[1:] != sample_value.shape[1:]:
+                    raise ValueError(f"Inconsistent memory burn-in field {key!r}: {value.shape}")
+                batched_value[index, :length] = value
+            burnin_batch[key] = batched_value
+        # _condition_memory is called before the autocast block in the base
+        # class (_predict_from_features:382), so open autocast here to match
+        # the bf16 dtype of execution_memory weights on CUDA.
+        device = action_queries.device
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            memory_conditioned, _, _, memory_summary, memory_channel_gate, memory_gate = self.execution_memory(
+                action_queries, memory_records, burnin_batch
+            )
+            # The same retrieved history conditions waypoint decoding and the
+            # action path.  The projection is zero-initialized so the original
+            # spatial checkpoint remains the optimization starting point.
+            waypoint_features = last_hidden + self.memory_waypoint_projection(memory_summary).unsqueeze(1)
         return waypoint_features, memory_conditioned, attention_mask, {
-            "memory_gate_mean": memory_gate,
+            "memory_gate_mean": memory_gate.detach().float().mean(),
             "memory_gate_channel_mean": memory_channel_gate.detach().float().mean(),
         }
 

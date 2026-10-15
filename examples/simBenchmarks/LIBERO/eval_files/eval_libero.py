@@ -243,7 +243,13 @@ def eval_libero(args: Args) -> None:
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
                 obs, reward, done, info = env.step(delta_action.tolist())
-                if hasattr(client_model, "record_executed_action"):
+                # A memory record represents the first action of a newly
+                # requested chunk.  The remaining actions are already queued
+                # and must not be appended as separate execution records.
+                if (
+                    hasattr(client_model, "record_executed_action")
+                    and step % client_model.action_chunk_size == 0
+                ):
                     client_model.record_executed_action(delta_action, step)
                 if done:
                     task_successes += 1
