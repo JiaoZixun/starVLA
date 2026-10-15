@@ -26,6 +26,7 @@ framework:
     waypoint_weight: 1.0
     waypoint_rotation_weight: 0.25
     action_geometry_weight: 0.0
+    effect_weight: 0.0
   memory:
     width: 256
     heads: 4
@@ -37,7 +38,6 @@ framework:
     visual_tokens: 8
     visual_feature_dim: 3
     bptt_records: 8
-    effect_weight: 0.0
 
 datasets:
   vla_data:
@@ -53,7 +53,6 @@ datasets:
     memory_bptt_records: 8
     memory_decision_frame_only: true
     drop_incomplete_action_chunks: true
-    effect_weight: 0.0
     per_device_batch_size: 32
     num_workers: 8
     pin_memory: true
