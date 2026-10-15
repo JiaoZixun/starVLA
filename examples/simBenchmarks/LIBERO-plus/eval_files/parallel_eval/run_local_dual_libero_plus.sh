@@ -13,9 +13,11 @@ NVIDIA_EGL_VENDOR_JSON="${NVIDIA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/
 RUN_ID="${RUN_ID:-qwen35_0p8b_libero_plus_$(date +%Y%m%d_%H%M%S)}"
 RESULT_ROOT="${RESULT_ROOT:-${STARVLA_DIR}/results/${RUN_ID}}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-1}"
-TASKS_PER_GPU="${TASKS_PER_GPU:-1}"
+# Each suite is split into two workers on the single selected GPU.
+TASKS_PER_GPU="${TASKS_PER_GPU:-2}"
 SAVE_VIDEOS="${SAVE_VIDEOS:-0}"
 MODEL_SELECTION="${MODEL_SELECTION:-both}"
+EVAL_GPU_ID="${EVAL_GPU_ID:-1}"
 PYTHONUNBUFFERED=1
 
 SUITES=(libero_10 libero_goal libero_object libero_spatial)
@@ -37,7 +39,11 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 [[ "${TASKS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] || fail "TASKS_PER_GPU must be a positive integer."
 [[ "${SAVE_VIDEOS}" =~ ^[01]$ ]] || fail "SAVE_VIDEOS must be 0 or 1."
 [[ "${MODEL_SELECTION}" =~ ^(baseline|spatial|both)$ ]] || fail "MODEL_SELECTION must be baseline, spatial, or both."
+[[ "${EVAL_GPU_ID}" =~ ^[0-9]+$ ]] || fail "EVAL_GPU_ID must be a non-negative GPU index."
 command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi is required."
+nvidia-smi --query-gpu=index --format=csv,noheader,nounits \
+  | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "${EVAL_GPU_ID}" \
+  || fail "GPU ${EVAL_GPU_ID} is unavailable."
 
 [[ -s "${BASELINE_CKPT}" ]] || fail "Checkpoint is missing or empty: ${BASELINE_CKPT}"
 [[ "$(stat -c '%s' "${BASELINE_CKPT}")" == "1748288891" ]] || fail "Baseline checkpoint has an unexpected size: ${BASELINE_CKPT}"
@@ -144,14 +150,12 @@ for suite, n_expected in expected.items():
 print("LIBERO paths:", get_libero_path("assets"), get_libero_path("bddl_files"), get_libero_path("init_states"))
 PY
 
-for gpu in 0 1; do
-  nvidia-smi --query-gpu=index --format=csv,noheader,nounits | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "${gpu}" || fail "GPU ${gpu} is unavailable."
-  echo "Checking NVIDIA EGL on physical GPU ${gpu}..."
-  CUDA_VISIBLE_DEVICES="${gpu}" MUJOCO_EGL_DEVICE_ID="${gpu}" "${LIBERO_PYTHON}" "${STARVLA_DIR}/examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py"
-done
+echo "Checking NVIDIA EGL on physical GPU ${EVAL_GPU_ID}..."
+CUDA_VISIBLE_DEVICES="${EVAL_GPU_ID}" MUJOCO_EGL_DEVICE_ID="${EVAL_GPU_ID}" "${LIBERO_PYTHON}" \
+  "${STARVLA_DIR}/examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py"
 
-echo "Running one no-policy LIBERO-plus environment render smoke test on GPU 0..."
-CUDA_VISIBLE_DEVICES=0 MUJOCO_EGL_DEVICE_ID=0 "${LIBERO_PYTHON}" - <<'PY'
+echo "Running one no-policy LIBERO-plus environment render smoke test on GPU ${EVAL_GPU_ID}..."
+CUDA_VISIBLE_DEVICES="${EVAL_GPU_ID}" MUJOCO_EGL_DEVICE_ID="${EVAL_GPU_ID}" "${LIBERO_PYTHON}" - <<'PY'
 import json
 import os
 import io
@@ -183,24 +187,37 @@ PY
 echo "Preflight passed. No policy evaluation has been launched."
 echo "Result root: ${RESULT_ROOT}"
 echo "Checkpoints: ${BASELINE_CKPT} ; ${SPATIAL_CKPT}"
-echo "Episodes per model: 10030 (${NUM_TRIALS_PER_TASK} per task)"
+EPISODES_PER_MODEL=0
+for suite in "${SUITES[@]}"; do
+  EPISODES_PER_MODEL=$((EPISODES_PER_MODEL + SUITE_TASKS[${suite}] * NUM_TRIALS_PER_TASK))
+done
+HISTORICAL_EPISODES=2000
+HISTORICAL_MINUTES=70
+ESTIMATED_MODEL_MINUTES=$(( (EPISODES_PER_MODEL * HISTORICAL_MINUTES + HISTORICAL_EPISODES - 1) / HISTORICAL_EPISODES ))
+if [[ "${MODEL_SELECTION}" == "both" ]]; then MODEL_COUNT=2; else MODEL_COUNT=1; fi
+ESTIMATED_TOTAL_MINUTES=$((ESTIMATED_MODEL_MINUTES * MODEL_COUNT))
+echo "GPU: ${EVAL_GPU_ID}; four suites per model run in parallel; selected models run sequentially."
+echo "Episodes per model: ${EPISODES_PER_MODEL} (${NUM_TRIALS_PER_TASK} per task)"
+echo "Estimated duration: ~${ESTIMATED_MODEL_MINUTES} minutes/model, ~${ESTIMATED_TOTAL_MINUTES} minutes total (based on the prior 2,000-episode LIBERO run)."
+echo "Estimated completion: $(date -d "+${ESTIMATED_TOTAL_MINUTES} minutes" '+%Y-%m-%d %H:%M:%S %Z')"
 echo "Video saving: ${SAVE_VIDEOS}"
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
 launch_model() {
-  local model_name="$1" ckpt="$2" gpu="$3"
+  local model_name="$1" ckpt="$2"
   local model_out="${RESULT_ROOT}/${model_name}"
   mkdir -p "${model_out}"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Starting ${model_name} on GPU ${EVAL_GPU_ID}."
   local -a pids=()
   local -a suites=(libero_10 libero_goal libero_object libero_spatial)
   local suite
   for suite in "${suites[@]}"; do
     local total="${SUITE_TASKS[${suite}]}"
-    GPU_ID="${gpu}" tasks_per_gpu="${TASKS_PER_GPU}" your_ckpt="${ckpt}" \
+    GPU_ID="${EVAL_GPU_ID}" tasks_per_gpu="${TASKS_PER_GPU}" your_ckpt="${ckpt}" \
       output_dir="${model_out}" SAVE_VIDEOS="${SAVE_VIDEOS}" \
-      "${SCRIPT_DIR}/eval_libero_in_one.sh" "${suite}" 0 "${total}" \
+      bash "${SCRIPT_DIR}/eval_libero_in_one.sh" "${suite}" 0 "${total}" \
       >"${model_out}/${suite}.launcher.log" 2>&1 &
     pids+=("$!")
   done
@@ -208,6 +225,11 @@ launch_model() {
   for pid in "${pids[@]}"; do
     wait "${pid}" || failed=1
   done
+  if (( failed == 0 )); then
+    "${LIBERO_PYTHON}" "${STARVLA_DIR}/examples/simBenchmarks/LIBERO-plus/eval_files/parallel_eval/aggregate_results.py" \
+      --root_path "${model_out}"
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Finished ${model_name} (status=${failed})."
   return "${failed}"
 }
 
@@ -215,16 +237,14 @@ baseline_status=0
 spatial_status=0
 case "${MODEL_SELECTION}" in
   baseline)
-    launch_model baseline "${BASELINE_CKPT}" 0 || baseline_status=$?
+    launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
     ;;
   spatial)
-    launch_model spatial "${SPATIAL_CKPT}" 1 || spatial_status=$?
+    launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
     ;;
   both)
-    launch_model baseline "${BASELINE_CKPT}" 0 & baseline_pid=$!
-    launch_model spatial "${SPATIAL_CKPT}" 1 & spatial_pid=$!
-    wait "${baseline_pid}" || baseline_status=$?
-    wait "${spatial_pid}" || spatial_status=$?
+    launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
+    launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
     ;;
 esac
 
