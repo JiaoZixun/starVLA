@@ -3,9 +3,12 @@
 # Implemented by [Shijie LIAN/ Huazhong University of Science & Technology] in [2026].
 # Design and Merged by [Jinhui YE / HKUST University] in [2026].
 
+import os
+from pathlib import Path
 from typing import Optional
 
 import torch
+from huggingface_hub import snapshot_download
 from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
 from starVLA.training.trainer_utils import initialize_overwatch
 from transformers import AutoProcessor
@@ -30,6 +33,45 @@ _ACTION_TOKEN_MIN = 248077  # how can we know this range? check how you add fast
 _ACTION_TOKEN_MAX = (
     248077 + 2047
 )  # here only for fast_tokenizer, see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md
+
+
+def _resolve_local_qwen35_checkpoint(
+    model_id: str,
+    revision: Optional[str],
+    *,
+    cache_dir: Optional[str] = None,
+) -> str:
+    """Resolve a Qwen3.5 model id to a local snapshot without network access.
+
+    Transformers 5.x may call ``huggingface_hub.model_info`` while constructing
+    a tokenizer when it receives a Hub repo id.  That happens even when all
+    model files are already cached.  Passing the concrete snapshot directory
+    avoids that remote metadata lookup entirely.
+    """
+
+    candidate = Path(str(model_id)).expanduser()
+    if candidate.is_dir():
+        return str(candidate.resolve())
+
+    try:
+        snapshot = snapshot_download(
+            repo_id=str(model_id),
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        cache_hint = f" in cache `{cache_dir}`" if cache_dir else " in the local Hugging Face cache"
+        raise FileNotFoundError(
+            f"Qwen3.5 checkpoint `{model_id}`{cache_hint} is unavailable. "
+            "Training is configured for offline loading and will not contact Hugging Face; "
+            "set framework.qwenvl.local_model_path to a complete local snapshot."
+        ) from exc
+
+    resolved = Path(snapshot).expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Resolved Qwen3.5 snapshot is not a directory: {resolved}")
+    return str(resolved)
 
 
 import torch.nn as nn
@@ -57,9 +99,33 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
+        # Keep the Hub id for framework dispatch, but allow launchers to inject
+        # an exact local snapshot path.  This is useful for offline training and
+        # prevents Transformers from performing a remote model-info request.
+        local_model_path = qwenvl_config.get("local_model_path")
+        if local_model_path:
+            model_id = str(local_model_path)
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
         revision = qwenvl_config.get("revision")
-        hub_kwargs = {"revision": revision} if revision else {}
+        local_files_only = qwenvl_config.get("local_files_only", True)
+        if isinstance(local_files_only, str):
+            local_files_only = local_files_only.lower() in {"1", "true", "yes", "on"}
+        # The offline environment variables are an additional safety net for
+        # launch scripts.  They must never be able to turn an offline run back
+        # into a network request.
+        if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+            local_files_only = True
+
+        if local_files_only:
+            model_id = _resolve_local_qwen35_checkpoint(
+                model_id,
+                revision,
+                cache_dir=qwenvl_config.get("cache_dir"),
+            )
+            hub_kwargs = {}
+            logger.info(f"Using local Qwen3.5 checkpoint: {model_id}")
+        else:
+            hub_kwargs = {"revision": revision} if revision else {}
 
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
@@ -71,9 +137,10 @@ class _QWen3_5_VL_Interface(nn.Module):
             model_id,
             attn_implementation=attn_implementation,
             torch_dtype=torch.bfloat16,
+            local_files_only=local_files_only,
             **hub_kwargs,
         )
-        processor = AutoProcessor.from_pretrained(model_id, **hub_kwargs)
+        processor = AutoProcessor.from_pretrained(model_id, local_files_only=local_files_only, **hub_kwargs)
         processor.tokenizer.padding_side = "left"
 
         if qwenvl_config.get("gradient_checkpointing", False):

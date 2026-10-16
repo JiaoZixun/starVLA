@@ -1,6 +1,6 @@
 # Qwen3.5-0.8B Spatial-Memory OFT
 
-状态：代码和数据 sidecar 已完成。今天的训练日志显示 Stage A 曾在 CUDA0 运行到 3,970/5,000 步后停止；没有 5,000 步 checkpoint，当前也没有活动训练进程，因此该阶段明天需要从 spatial checkpoint 重新运行。尚未完成独立的 NVIDIA EGL renderer 验证。
+状态：Stage A 的 5,000 步 checkpoint 已完成。Stage B 曾因 Transformers 5.x 在 Hub repo id 上触发远程 `model_info` 请求而退出；现在训练加载器会把模型解析为本地 snapshot，并强制 `local_files_only=True`，启动脚本也会在长任务前用本地 processor 做预检。2026-10-16 13:29（CST）已在 CUDA 0 从步骤 5,000 恢复 Stage B。
 
 当前分支从 `spatial` 切出为 `libero-0.8B-spatial-mem`。模型保留 Qwen3.5-0.8B 和原 OFT action head，单次 Qwen 前向得到当前视觉语言 hidden states 和 action queries。新增的 memory encoder 不重新调用 Qwen，因此因果历史不会把 Qwen 前向次数扩大为 8 倍。
 
@@ -31,7 +31,7 @@ memory 配置为宽度 256、4 个 heads、2 层、32 条近期记录和 8 个�
 
 ## 训练配置
 
-启动脚本：`examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh`。阶段 A 从已训练 spatial checkpoint 加载 Qwen、action、waypoint 和 adapter，冻结这些模块并运行 5,000 步 memory/spatial warmup；阶段 B 从阶段 A checkpoint 恢复并全量训练到累计 50,000 步。两阶段均为 CUDA 0、batch size 32、8 个 DataLoader workers、persistent workers、pin memory 和 prefetch 2。脚本今天不执行 CUDA 验证；明天启动前再按仓库 `AGENTS.md` 完成 `nvidia-smi` 和 LIBERO-plus EGL renderer 检查。
+启动脚本：`examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh`。阶段 A 从已训练 spatial checkpoint 加载 Qwen、action、waypoint 和 adapter，冻结这些模块并运行 5,000 步 memory/spatial warmup；阶段 B 从阶段 A checkpoint 恢复并全量训练到累计 50,000 步。两阶段均为 CUDA 0、batch size 32、8 个 DataLoader workers、persistent workers、pin memory 和 prefetch 2。脚本会设置 `HF_HUB_OFFLINE=1`、检查本地 Qwen3.5 snapshot 和 processor，并按仓库 `AGENTS.md` 完成 `nvidia-smi` 与 NVIDIA EGL renderer 检查。
 
 ```bash
 cd /data1/jiaozx/starVLA
@@ -40,7 +40,7 @@ GPU_ID=0 STAGE=all WANDB_MODE=disabled \
 bash examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh
 ```
 
-本次 Stage A 日志测得约 0.66 秒/步（3,970 步约 43 分 35 秒），但该阶段冻结了 Qwen 和原 action path，不能直接代表全量训练速度。此前空间 OFT 全量训练约 1.1 秒/步；按 Stage A 约 55 分钟、Stage B 剩余 45,000 步约 13.8 小时估算，从头完成两阶段约 14.7 小时，建议预留 15–16 小时。明天完成独立 CUDA/EGL 检查后，以前 100–500 个全量训练步重新确认 ETA。memory sidecar 预处理不占训练 GPU 时间。
+本次 Stage A 日志测得约 0.66 秒/步；当前 Stage B 启动后的稳定吞吐约 1.0–1.05 步/秒，剩余 44,895 步预计还需约 12 小时，预计在 2026-10-17 01:30–02:00（CST）完成。memory sidecar 预处理不占训练 GPU 时间。
 
 ## 验证清单
 

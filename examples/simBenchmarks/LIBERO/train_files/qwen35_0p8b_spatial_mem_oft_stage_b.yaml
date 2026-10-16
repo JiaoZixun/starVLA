@@ -7,6 +7,9 @@ framework:
   name: QwenSpatialMemOFT
   qwenvl:
     base_vlm: Qwen/Qwen3.5-0.8B
+    # Resolve this Hub id to the local snapshot before loading; no network access.
+    local_files_only: true
+    local_model_path: null
     attn_implementation: sdpa
     revision: 2fc06364715b967f1860aea9cf38778875588b17
     gradient_checkpointing: false
