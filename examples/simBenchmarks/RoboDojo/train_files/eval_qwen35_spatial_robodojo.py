@@ -11,7 +11,8 @@ if __name__ == "__main__":
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("extra", nargs=argparse.REMAINDER)
     a=ap.parse_args()
-    cmd=[sys.executable, str(Path(__file__).with_name("eval_qwen35_robodojo.py")),
+    evaluator = Path(__file__).resolve().parents[1] / "eval_files/eval_qwen35_robodojo.py"
+    cmd=[sys.executable, str(evaluator),
          "--checkpoint", str(a.checkpoint), "--output", str(a.output),
          "--checkpoint-label", "qwen35_0p8b_spatial", "--expected-parameters", "0", *a.extra]
     raise SystemExit(subprocess.call(cmd))

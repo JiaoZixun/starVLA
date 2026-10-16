@@ -82,7 +82,7 @@ def main() -> None:
 
     bench = Path(os.environ.get("ROBODOJO_PATH", "/home/data/roboskills/RoboDojo")).resolve()
     policy = bench / "XPolicyLab/policy/starVLA"
-    source = policy / "source_starvla"
+    source = Path(os.environ.get("STARVLA_SOURCE_DIR", policy / "source_starvla")).resolve()
     checkpoint = args.checkpoint.resolve()
     base_model = args.base_model.resolve()
     policy_env = Path(os.environ.get("POLICY_ENV", "/home/data/Libero/envs/mint-light")).resolve()
@@ -212,7 +212,7 @@ print(f'Strict checkpoint load OK: {count:,} parameters')
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     env["STARVLA_INFERENCE_LATENCY_LOG"] = str(output / "inference_latency.jsonl")
     env["STARVLA_INFERENCE_LATENCY_TASKS"] = ",".join(latency_tasks)
-    env["STARVLA_INFERENCE_LATENCY_MODEL"] = "qwen35_0p8b_oft"
+    env["STARVLA_INFERENCE_LATENCY_MODEL"] = args.checkpoint_label
     print(f"Output: {output}\nTasks: {len(tasks)}, layouts/task: {args.episodes}, parallel envs: {args.num_envs}", flush=True)
     print(f"Recording action-chunk inference latency for: {', '.join(latency_tasks)}", flush=True)
     if args.check_only:

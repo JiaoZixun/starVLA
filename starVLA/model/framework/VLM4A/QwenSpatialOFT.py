@@ -125,7 +125,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         return qin, hidden, ah
 
     def _spatial_forward(self, hidden, action_hidden, examples):
-        if not self.spatial_enabled or not all("geometry" in e and "current_pose" in e["geometry"] for e in examples):
+        if not self.spatial_enabled:
             return action_hidden, hidden.new_zeros(()), hidden.new_zeros(()), hidden.new_zeros(())
         wp_raw = self.waypoint_model(hidden)
         # 9 = translation + rotation 6D; keep explicit numeric values in the token path.
@@ -136,10 +136,11 @@ class QwenSpatialOFT(Qwenvl_OFT):
         rel_token = (pred_pose_feat[:, 1] - pred_pose_feat[:, 0]).mean(1, keepdim=True)
         z = self.waypoint_model.token_proj(torch.cat((z, rel_token), dim=1))
         adapted = self.spatial_adapter(action_hidden, z)
-        tau = self.waypoint_model.tau
-        current = torch.as_tensor(np.stack([e["geometry"]["current_pose"] for e in examples]), device=hidden.device, dtype=torch.float32)
-        if not all("future_pose" in e["geometry"] and "future_valid" in e["geometry"] for e in examples):
+        # Waypoints come from VLM hidden states only; geometry labels exist solely for the training losses.
+        geometry_keys = ("current_pose", "future_pose", "future_valid")
+        if not all(e.get("geometry") and all(k in e["geometry"] for k in geometry_keys) for e in examples):
             return adapted, hidden.new_zeros(()), hidden.new_zeros(()), hidden.new_zeros(())
+        current = torch.as_tensor(np.stack([e["geometry"]["current_pose"] for e in examples]), device=hidden.device, dtype=torch.float32)
         target_list, valid_list = [], []
         for e in examples:
             g = e["geometry"]
