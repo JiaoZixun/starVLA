@@ -22,6 +22,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.tools import read_mode_config
 from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
 from starVLA.dataloader.libero_memory import LiberoMemoryBuffer
+from fast_sensor_noise import patch_libero_glass_blur
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
@@ -394,6 +395,12 @@ def eval_libero(args: Args) -> None:
     rank = int(os.getenv("RANK", "0"))
     print(f"🌍 Rank {rank}/{world_size} | GPU: {local_rank}")
     torch.cuda.set_device(local_rank)
+
+    # Sensor Noise tasks otherwise spend most of their time in the vendored
+    # Python pixel-swap loop.  Patch it before creating any LIBERO-plus envs;
+    # the accelerated implementation preserves the same RNG offsets and swap
+    # order while compiling the inner loop.
+    patch_libero_glass_blur()
 
     # Set random seed
     np.random.seed(args.seed)
