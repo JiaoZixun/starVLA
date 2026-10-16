@@ -191,6 +191,7 @@ class ModelClient:
             "action_chunk_size": self.action_chunk_size,
             "episodes_per_task": int(episodes_per_task),
             "overall": summarize(all_values),
+            "raw_latencies_ms": all_values,
             "tasks": [
                 {
                     "task_id": task_id,
