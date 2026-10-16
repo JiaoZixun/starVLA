@@ -76,7 +76,15 @@ echo "Output: ${BASELINE_RESULT_ROOT}"
 # its JSON after the whole range finishes, so [1260, 1875) has no surviving
 # result.  Restart the entire [1260, 2519) half; it pairs with the existing
 # 0_to_1260.json to cover all 2519 tasks.
-if ! GPU_ID="${EVAL_GPU_ID}" tasks_per_gpu="${TASKS_PER_GPU}" your_ckpt="${BASELINE_CKPT}" \
+#
+# Run this half as a SINGLE worker.  np.random.seed(7) is applied once per
+# process and glass_blur draws its offsets from that global stream, so the
+# sensor-noise realization of a task depends on the worker partition.  The
+# other three baseline suites, and every suite in phase 2, use two workers
+# split at the suite midpoint.  Keeping [1260, 2519) in one worker reproduces
+# exactly the partition phase 2 will use for this suite, so the baseline and
+# spatial numbers stay comparable.
+if ! GPU_ID="${EVAL_GPU_ID}" tasks_per_gpu=1 your_ckpt="${BASELINE_CKPT}" \
   output_dir="${BASELINE_RESULT_ROOT}" SAVE_VIDEOS="0" \
   bash "${SCRIPT_DIR}/eval_libero_in_one.sh" libero_10 1260 2519 \
   >"${BASELINE_RESULT_ROOT}/libero_10_resume_1260_2519.launcher.log" 2>&1; then
