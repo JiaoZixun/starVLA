@@ -86,11 +86,11 @@ class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
         return result
 
     def _memory_burnin_records(self, trajectory_id, frame_index):
-        cutoff = max(0, int(frame_index) - self.memory_spec.decision_stride * self.memory_spec.recent_records)
-        indices = np.arange(0, cutoff, self.memory_spec.decision_stride, dtype=np.int64)
-        records = [self._memory_record_at(trajectory_id, int(index)) for index in indices]
+        # Serving retains only the recent_records * stride environment steps,
+        # so it has no older burn-in rows when rebuilding memory per request.
+        # Keep the training path identical and bound to the same causal window.
         empty = self.memory_spec.empty()
-        return {key: (np.stack([record[key] for record in records]) if records else np.zeros((0, *value.shape[1:]), dtype=value.dtype))
+        return {key: np.zeros((0, *value.shape[1:]), dtype=value.dtype)
                 for key, value in empty.items()}
 
     def _pack_sample(self, data):

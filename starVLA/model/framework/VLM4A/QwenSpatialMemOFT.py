@@ -207,6 +207,18 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             return recent, None
         if any(not isinstance(b, dict) for b in burnins):
             raise ValueError("Every memory sample must provide memory_burnin_records")
+        for burnin in burnins:
+            if set(burnin) != set(keys):
+                raise ValueError(f"Memory burn-in fields must be {keys}")
+            valid_mask = np.asarray(burnin["valid_mask"])
+            if valid_mask.ndim != 1 or valid_mask.dtype != np.bool_:
+                raise ValueError("Memory burn-in valid_mask must be a boolean vector")
+            for key in keys:
+                value = np.asarray(burnin[key])
+                if value.shape[0] != valid_mask.shape[0]:
+                    raise ValueError(f"Memory burn-in field {key} has inconsistent length")
+                if not np.isfinite(value).all():
+                    raise ValueError(f"Memory burn-in field {key} contains non-finite values")
         max_len = max(len(b["valid_mask"]) for b in burnins)
         burn = {}
         for key in keys:

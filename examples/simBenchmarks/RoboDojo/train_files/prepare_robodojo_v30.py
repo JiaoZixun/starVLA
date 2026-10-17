@@ -43,13 +43,14 @@ MODALITY = {
 
 
 def _link_or_validate(src: Path, dst: Path) -> None:
+    relative_target = Path(os.path.relpath(src, dst.parent))
     if dst.is_symlink():
-        if dst.resolve() == src.resolve():
+        if dst.readlink() == relative_target:
             return
         dst.unlink()
     elif dst.exists():
         raise FileExistsError(f"Refusing to overwrite existing path: {dst}")
-    dst.symlink_to(src, target_is_directory=src.is_dir())
+    dst.symlink_to(relative_target, target_is_directory=src.is_dir())
 
 
 def prepare(raw: Path, adapter: Path) -> Path:

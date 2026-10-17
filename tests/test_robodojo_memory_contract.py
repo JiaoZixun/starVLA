@@ -53,6 +53,43 @@ def test_future_rows_never_enter_dataset_history():
         np.testing.assert_array_equal(before[key], after[key])
 
 
+def test_training_and_serving_keep_the_same_bounded_window_after_rollover():
+    spec = RoboDojoMemorySpec(3, 4)
+    dataset = object.__new__(RoboDojoMemorySingleDataset)
+    dataset.memory_spec = spec
+    dataset.curr_traj_data = episode_data(80)
+    buffer = RoboDojoMemoryBuffer(3, 4)
+    for step in range(80):
+        if step == 40:
+            offline_burnin = dataset._memory_burnin_records(0, step)
+            online_burnin = buffer.build_burnin(step)
+            for key in offline_burnin:
+                np.testing.assert_array_equal(offline_burnin[key], online_burnin[key])
+                assert offline_burnin[key].shape[0] == 0
+        row = dataset.curr_traj_data.iloc[step]
+        buffer.append(row["observation.state"], row["action"], source_step=step)
+
+
+def test_batch_one_visual_memory_forward():
+    spec = RoboDojoMemorySpec(3, 4)
+    memory = CausalExecutionMemory(32, width=16, heads=2, layers=1)
+    buffer = RoboDojoMemoryBuffer(3, 4)
+    images = [np.full((24, 32, 3), value, np.uint8) for value in (20, 80, 160)]
+    for step in range(12):
+        buffer.append(np.full(14, step, np.float32), np.full(14, step + 100, np.float32),
+                      source_step=step, images=images)
+    record = buffer.build(12)
+    records = {key: np.expand_dims(value, 0) for key, value in record.items()}
+    burnin = {key: np.expand_dims(value, 0) for key, value in buffer.build_burnin(12).items()}
+    queries = torch.randn(1, 5, 32, requires_grad=True)
+    conditioned, summary, gate = memory(queries, records, burnin)
+    assert conditioned.shape == (1, 5, 32)
+    assert summary.shape == (1, 16)
+    assert torch.isfinite(conditioned).all() and 0 <= gate <= 1
+    (conditioned.square().mean() + summary.square().mean()).backward()
+    assert torch.isfinite(queries.grad).all()
+
+
 def tiny_model(spec):
     model = QwenSpatialMemOFT.__new__(QwenSpatialMemOFT)
     torch.nn.Module.__init__(model)

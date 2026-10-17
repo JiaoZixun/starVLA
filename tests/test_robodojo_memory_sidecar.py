@@ -1,5 +1,6 @@
 """Linked preprocessing must preserve causal online/offline semantics."""
 import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -40,7 +41,9 @@ def test_linked_indices_match_online_every_frame_without_copying_original(source
     output = tmp_path / "memory/v1"
     before = {str(p.relative_to(source)): sha256(p) for p in source.rglob("*") if p.is_file()}
     build_sidecar(source, output, spec, workers=2)
-    validate_sidecar(output, source, spec)
+    manifest = validate_sidecar(output, source, spec)
+    assert manifest["source"] == os.path.relpath(source, output)
+    assert not os.path.isabs(manifest["source"])
     assert (output / "source_dataset").is_symlink()
     assert (output / "source_dataset").resolve() == source
     # Explicit file list: only derived indices, manifest and one source symlink.

@@ -234,7 +234,8 @@ def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=T
         visual = bool(has_visual)
         manifest = {
             "format": "robodojo_causal_memory_indices", "format_version": 2 if visual else 1,
-            "source": str(source), "source_link": "source_dataset",
+            # Keep the published artifact relocatable with its original data.
+            "source": os.path.relpath(source, output), "source_link": "source_dataset",
             "representation": REPRESENTATION, "channel_order": CHANNELS, "camera_order": CAMERAS,
             "recent_records": spec.recent_records, "decision_stride_env_steps": spec.decision_stride,
             "use_pose": spec.use_pose, "padding": -1,

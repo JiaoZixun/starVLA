@@ -38,19 +38,25 @@ persistent workers、pin memory 和预取。训练使用 SDPA、自动 BF16（�
 
 ## 原始数据与额外数据分开
 
-已对当前 RoboDojo v3 全量数据完成 memory 预处理：3,500 个 episode、
-1,856,102 帧。原始数据位于
-`/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video`。
-新增数据独立存储在同一 bundle 的 `memory_sidecars/robodojo_v30_r16_s8_visual_v2`：
+Memory 预处理只生成索引和视觉 patch，不复制原始 parquet、视频或统计数据。
+原始数据 adapter 与新增数据应保存在同一目录树中：
 
 ```text
-memory_sidecars/robodojo_v30_r16_s8_visual_v2/
-    manifest.json
-    source_dataset -> ../../data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video
-    episodes/000000.npy                    # int32 [episode_length, 16]
-    episodes/000000.visual.npy             # uint8 [episode_length, 3, 8, 8, 8, 3]
-    ...
+starvla_robodojo_v30/
+├── RoboDojo_lerobot_v30_video/       # metadata adapter; data/videos link to raw data
+└── memory_sidecars/robodojo_v30_r16_s8_visual_v2/
+    ├── manifest.json
+    ├── source_dataset -> ../../RoboDojo_lerobot_v30_video
+    └── episodes/
+        ├── 000000.npy                # int32 [episode_length, 16]
+        ├── 000000.visual.npy         # uint8 [episode_length, 3, 8, 8, 8, 3]
+        └── ...
 ```
+
+`source_dataset`、manifest 中的 source 路径，以及 adapter 下指向原始数据的链接
+都使用相对路径。移动到服务器时保留这棵目录树，原始数据和 sidecar 会继续对应；
+加载器还会校验 metadata 和 parquet SHA256，源数据不匹配时拒绝训练。当前机器
+生成目录为 `/home/data/robodojo_cache/starvla_robodojo_v30/memory_sidecars/robodojo_v30_r16_s8_visual_v2`。
 
 索引 `.npy` 只保存严格过去的帧索引；无效位置为 -1；visual `.npy` 保存每帧三路
 patch。训练加载器按 episode 和
@@ -66,14 +72,14 @@ memory 参数及每个 episode 的源 shard/起止行与索引文件校验值。
 仓库根目录、安装 pandas/pyarrow/numpy 的 Python 环境中执行（路径按实际部署设置）：
 
 ```bash
-export ROBODOJO_SPATIAL_ROOT=/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013
+export ROBODOJO_SPATIAL_ROOT=/home/data/robodojo_cache/starvla_robodojo_v30
 PYTHONPATH=. python examples/simBenchmarks/RoboDojo/train_files/prepare_memory_sidecar.py \
-  --data-root "$ROBODOJO_SPATIAL_ROOT/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video" \
+  --data-root "$ROBODOJO_SPATIAL_ROOT/RoboDojo_lerobot_v30_video" \
   --sidecar "$ROBODOJO_SPATIAL_ROOT/memory_sidecars/robodojo_v30_r16_s8_visual_v2" \
   --workers 3
 ```
 
-当前版本已经存在，复核时在上述命令后添加 `--validate`，不会重新生成或写入数据。
+若目标目录已经存在，复核时在上述命令后添加 `--validate`，不会重新生成或写入数据。
 变更窗口/步距时使用新的输出版本，并同步设置 `--recent-records`、
 `--decision-stride` 和训练配置；开启 pose 时还需 `--use-pose`。
 
