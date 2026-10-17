@@ -31,6 +31,8 @@ from starVLA.model.framework.base_framework import baseframework, merge_config_o
 from starVLA.model.framework.share_tools import read_mode_config
 
 from deployment.model_server.policy_norm_processor import PolicyNormProcessor
+from deployment.model_server.robodojo_memory_adapter import RoboDojoMemorySessions
+from starVLA.utils.robodojo_memory import RoboDojoMemorySpec
 
 
 def _training_obs_image_size(model_cfg: Dict[str, Any]) -> Optional[List[int]]:
@@ -74,6 +76,12 @@ class PolicyServerWrapper:
         model_cfg, norm_stats = read_mode_config(self._ckpt_path)
         model_cfg = merge_config_overrides(model_cfg, config_overrides)
         self._model_cfg = model_cfg
+        memory = model_cfg.get("framework", {}).get("memory", {})
+        self._memory_sessions = None
+        if model_cfg.get("framework", {}).get("name") == "QwenSpatialMemOFT":
+            self._memory_sessions = RoboDojoMemorySessions(RoboDojoMemorySpec(
+                int(memory.get("recent_records", 16)), int(memory.get("decision_stride_env_steps", 8)),
+                bool(memory.get("use_pose", False))))
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]
@@ -156,6 +164,14 @@ class PolicyServerWrapper:
             proc = self._get_processor(self._default_unnorm_key)
             base["action_keys"] = proc.action_keys
             base["state_keys"] = proc.state_keys
+        if self._memory_sessions is not None:
+            spec = self._memory_sessions.spec
+            base["execution_memory"] = {
+                "recent_records": spec.recent_records, "stride": spec.decision_stride, "use_pose": spec.use_pose,
+                "required_fields": ["env_id", "episode_id", "env_step", "raw_state", "memory_feedback"],
+                "feedback": "Every completed environment step: source_step, raw state[14], actual executed_action[14]",
+                "representation": "raw_dual_arm_abs_qpos_v1",
+            }
         return base
 
     def predict_action(
@@ -187,6 +203,9 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
+        updates = None
+        if self._memory_sessions is not None:
+            examples, updates = self._memory_sessions.prepare(examples, proc.apply_state, namespace=effective_key)
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
@@ -194,4 +213,11 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
+        if updates is not None:
+            self._memory_sessions.commit(updates)
         return {"actions": unnorm}
+
+    def reset_memory(self) -> None:
+        """Clear all episode streams (individual streams use a new episode_id)."""
+        if self._memory_sessions is not None:
+            self._memory_sessions.reset()

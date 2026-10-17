@@ -398,3 +398,20 @@ class PolicyNormProcessor:
                 v = v.detach().cpu().numpy()
             parts.append(np.asarray(v))
         return np.concatenate(parts, axis=-1)
+
+    def apply_state(self, raw_state: np.ndarray) -> np.ndarray:
+        """Normalize raw proprioception through the saved training transforms."""
+        state = np.asarray(raw_state, dtype=np.float32).reshape(1, -1)
+        expected = sum(self._state_key_dims[k] for k in self._state_keys)
+        if state.shape != (1, expected) or not np.isfinite(state).all():
+            raise ValueError(f"Raw state must be finite [{expected}]")
+        data, cursor = {}, 0
+        for key in self._state_keys:
+            dim = self._state_key_dims[key]
+            data[key] = state[:, cursor:cursor + dim].copy()
+            cursor += dim
+        transformed = self._transform(data)
+        return np.concatenate([
+            v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
+            for v in (transformed[k] for k in self._state_keys)
+        ], axis=-1).astype(np.float32)

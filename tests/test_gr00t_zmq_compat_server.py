@@ -228,3 +228,18 @@ class Gr00tZmqCompatServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_gr00t_forwards_actual_execution_context_only():
+    wrapper = _StubWrapper()
+    wrapper.metadata = {"execution_memory": {"recent_records": 16}}
+    policy = Gr00tCompatPolicy(wrapper)
+    assert policy.get_modality_config()["execution_memory"]["context_location"] == "get_action.options.execution_memory"
+    context = {"env_id": "arm_pair", "episode_id": "episode_1", "env_step": 0,
+               "memory_feedback": [], "geometry": {"future_pose": "forbidden"}}
+    policy.get_action(_bridge_observation(), options={"execution_memory": context})
+    example = wrapper.requests[-1]["examples"][0]
+    assert example["env_id"] == "arm_pair"
+    assert example["memory_feedback"] == []
+    np.testing.assert_array_equal(example["raw_state"], example["state"].reshape(-1))
+    assert "geometry" not in example

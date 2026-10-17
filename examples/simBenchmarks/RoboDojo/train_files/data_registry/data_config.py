@@ -85,10 +85,23 @@ class RoboDojoArxX5H50Q99DataConfig:
         )
 
     def make_dataset(self, **kwargs):
-        # Keep the stock loader and its mixture semantics; geometry is an
-        # optional hook inside LeRobotSingleDataset and is disabled by default.
-        from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
-        return LeRobotSingleDataset(**{k: v for k, v in kwargs.items() if k != "dataset_name"})
+        # Memory is an opt-in dataset wrapper.  The regular spatial branch
+        # keeps the stock loader and its mixture semantics unchanged.
+        data_cfg = kwargs.get("data_cfg") or {}
+        if data_cfg.get("memory_enabled", False):
+            from starVLA.dataloader.robodojo_memory import RoboDojoMemorySingleDataset
+            dataset_cls = RoboDojoMemorySingleDataset
+        else:
+            from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
+            dataset_cls = LeRobotSingleDataset
+        memory_keys = {
+            "memory_recent_records", "memory_decision_stride", "memory_state_dim",
+            "memory_action_dim", "memory_use_pose",
+        }
+        memory_kwargs = {key: data_cfg[key] for key in memory_keys if key in data_cfg} if data_cfg.get("memory_enabled", False) else {}
+        init_kwargs = {k: v for k, v in kwargs.items() if k != "dataset_name"}
+        init_kwargs.update(memory_kwargs)
+        return dataset_cls(**init_kwargs)
 
 
 _ROBOT_TYPE = "robodojo_arx_x5_h50_q99"

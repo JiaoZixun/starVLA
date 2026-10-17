@@ -125,6 +125,15 @@ class Gr00tCompatPolicy:
         self, observation: Dict[str, Any], options: Optional[dict] = None
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         example = self.obs_to_example(observation)
+        context = (options or {}).get("execution_memory")
+        if context is not None:
+            if not isinstance(context, dict) or "state" not in example:
+                raise ValueError("execution_memory requires a context dict and raw proprioception")
+            # State modalities on the GR00T wire are raw robot coordinates.
+            # Only execution context is accepted; labels cannot enter the policy.
+            example["raw_state"] = example["state"].reshape(-1).copy()
+            for key in ("env_id", "episode_id", "env_step", "memory_feedback"):
+                example[key] = context[key]
         result = self._wrapper.predict_action(examples=[example], unnorm_key=self._unnorm_key)
         actions = np.asarray(result["actions"])  # (B, T, D)
         action_dict = self.split_actions(actions)
@@ -132,19 +141,30 @@ class Gr00tCompatPolicy:
         return action_dict, info
 
     def reset(self, options: Optional[dict] = None) -> Dict[str, Any]:
-        # starVLA inference is stateless per request; nothing to clear.
+        # Clear causal execution memory at an episode boundary.
+        reset_memory = getattr(self._wrapper, "reset_memory", None)
+        if reset_memory is not None:
+            reset_memory()
         return {"ok": True}
 
     def get_modality_config(self) -> Dict[str, Any]:
         """Not a real GR00T ModalityConfig — a plain-dict contract summary that
         lets clients sanity-check key order and dims at handshake time."""
-        return {
+        contract = {
             "state_keys": self._state_keys,
             "state_key_dims": self._state_key_dims,
             "action_keys": self._action_keys,
             "action_key_dims": self._action_key_dims,
             "unnorm_key": self._unnorm_key,
         }
+        memory = getattr(self._wrapper, "metadata", {}).get("execution_memory")
+        if memory is not None:
+            contract["execution_memory"] = {
+                **memory,
+                "context_location": "get_action.options.execution_memory",
+                "raw_state_source": "observation.state in DataConfig order",
+            }
+        return contract
 
     # -- Conversions -----------------------------------------------------------
 
