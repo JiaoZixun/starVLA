@@ -401,8 +401,11 @@ class RoboDojoMemorySidecar:
             if sha256(_inside(self.source, name, allow_symlinks=True)) != digest:
                 raise ValueError(f"Source metadata changed: {name}")
         self._verified_sources = set()
+        self._verified_visuals = set()
         self._episode = None
         self._indices = None
+        self._visual_episode = None
+        self._visual_values = None
         self.visual = bool(m.get("format_version") == 2 and m.get("visual_sidecar"))
         if self.visual:
             if m.get("camera_order") != CAMERAS or m.get("visual_shape") != list(MEMORY_VISUAL_SHAPE):
@@ -436,18 +439,26 @@ class RoboDojoMemorySidecar:
     def visual_tokens(self, episode, length):
         if not self.visual:
             return np.zeros((length, *MEMORY_VISUAL_SHAPE), dtype=np.uint8)
-        entry = self.manifest["episodes"][str(int(episode))]
+        episode = int(episode)
+        if self._visual_episode == episode:
+            if self._visual_values.shape[0] != length:
+                raise ValueError("Memory visual episode length differs from source")
+            return self._visual_values
+        entry = self.manifest["episodes"][str(episode)]
         if int(entry["length"]) != int(length):
             raise ValueError("Memory visual episode length differs from source")
         visual_entry = entry.get("visual")
         if not visual_entry:
             raise ValueError("Visual memory entry missing")
         path = _inside(self.root, visual_entry["file"])
-        if sha256(path) != visual_entry["sha256"]:
-            raise ValueError(f"Memory visual sidecar changed: {path}")
+        if episode not in self._verified_visuals:
+            if sha256(path) != visual_entry["sha256"]:
+                raise ValueError(f"Memory visual sidecar changed: {path}")
+            self._verified_visuals.add(episode)
         values = np.load(path, mmap_mode="r", allow_pickle=False)
         if values.dtype != np.uint8 or tuple(values.shape) != (length, *MEMORY_VISUAL_SHAPE):
             raise ValueError(f"Invalid memory visual sidecar shape/dtype: {values.shape}/{values.dtype}")
+        self._visual_episode, self._visual_values = episode, values
         return values
 
 

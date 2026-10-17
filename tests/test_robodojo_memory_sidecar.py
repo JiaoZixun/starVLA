@@ -192,6 +192,19 @@ def test_visual_build_hashes_source_parquet_after_video_hashes(source, tmp_path,
     assert manifest["source_files"]["data/chunk-000/file-000.parquet"]["sha256"] == sha256(data_path)
     assert manifest["total_frames"] == 201
     assert all("visual" in entry for entry in manifest["episodes"].values())
+    reader = RoboDojoMemorySidecar(output, source, RoboDojoMemorySpec())
+    actual_sha256 = sidecar.sha256
+    checked = []
+
+    def count_sha256(path):
+        checked.append(str(path))
+        return actual_sha256(path)
+
+    monkeypatch.setattr(sidecar, "sha256", count_sha256)
+    reader.visual_tokens(5, 180)
+    reader.visual_tokens(5, 180)
+    visual_path = str(output / manifest["episodes"]["5"]["visual"]["file"])
+    assert checked.count(visual_path) == 1
 
 
 def test_timestamp_decoder_reuses_last_nearest_frame_when_video_is_short(monkeypatch):
