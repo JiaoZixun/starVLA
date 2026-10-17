@@ -9,7 +9,8 @@ learned slots、gated retrieval 和 waypoint conditioning，保留当前 RoboDoj
 
 - state/action 均为原始 14D absolute qpos，顺序为左臂 6 关节、左夹爪、
   右臂 6 关节、右夹爪。历史数据不做 q99；当前 state 和输出动作使用 checkpoint
-  保存的训练 q99 transform，在线端复用同一实现。
+  保存的训练 q99 transform，在线端复用同一实现。parquet 中的 float64 state/action
+  在 q99 前统一为 float32，与在线输入精度一致，避免打包后才转换造成数值偏差。
 - 当前图像顺序为 `cam_high, cam_left_wrist, cam_right_wrist`，分辨率 224×224。
   不重复解码或编码历史图像。
 - 默认在当前环境步 `t` 采样 `t - 8 × [16, 15, ..., 1]`，负索引以零填充。
@@ -36,31 +37,56 @@ persistent workers、pin memory 和预取。训练使用 SDPA、自动 BF16（�
 
 ## 原始数据与额外数据分开
 
-本次仅交付架构、在线协议和训练/测速入口，**不执行新的数据预处理或长训练**。
-当前历史字段已存在于原始 parquet，可直接按需读取；无需复制或改写原始数据集。
-空间监督使用已有独立 `spatial_sidecar_dir`。
-
-后续 memory 预处理输出应放在原始数据目录之外，例如：
+已对当前 RoboDojo v3 全量数据完成 memory 预处理：3,500 个 episode、
+1,856,102 帧。原始数据位于
+`/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video`。
+新增数据独立存储在同一 bundle 的 `memory_sidecars/robodojo_v30_r16_s8_v1`：
 
 ```text
-/data/starvla_robodojo_v30/                  # 原始 LeRobot 数据，只读
-/data/robodojo_mem_sidecars/<version>/      # 新增缓存/特征，独立管理
+memory_sidecars/robodojo_v30_r16_s8_v1/
     manifest.json
-    episodes/<episode_id>.*
+    source_dataset -> ../../data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video
+    episodes/000000.npy                    # int32 [episode_length, 16]
+    ...
 ```
 
-manifest 必须记录原始数据集路径/标识、版本或校验信息、表示方式、维度和相机顺序；
-每个缓存必须通过 `episode_index + source_frame_index` 关联原始行，并验证帧连续性。
-保留原始 state/action 的含义与单位。新增特征只从对应当前/历史观测生成，不得由
-未来 chunk、未来 pose、奖励或成功标签生成。后续缓存读取接口需按此约束实现，
-本次没有生成缓存文件，也没有引入对尚不存在缓存的依赖。
+每个 `.npy` 只保存严格过去的帧索引；无效位置为 -1。训练加载器按 episode 和
+frame index 从原始 parquet 一次 gather 原始 14D state/action，不复制视频、
+state/action 或归一化统计，也不缓存未来标签。索引总量约 114 MiB；空间监督继续
+使用已有独立 `spatial_sidecar_dir`。默认 `use_pose=false`，没有生成额外 pose。
+
+manifest 记录原始路径、源 parquet 和元数据 SHA256、相机和双臂通道顺序、
+memory 参数及每个 episode 的源 shard/起止行与索引文件校验值。构建按源 shard
+并行，只读取数值列，拒绝帧缺失、错误维度、非有限数、通道错位和 episode 分片；
+完整构建后原子发布目录，不覆盖已有版本。原始数据树也可通过 symlink 挂载。
+
+仓库根目录、安装 pandas/pyarrow/numpy 的 Python 环境中执行（路径按实际部署设置）：
+
+```bash
+export ROBODOJO_SPATIAL_ROOT=/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013
+PYTHONPATH=. python examples/simBenchmarks/RoboDojo/train_files/prepare_memory_sidecar.py \
+  --data-root "$ROBODOJO_SPATIAL_ROOT/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video" \
+  --sidecar "$ROBODOJO_SPATIAL_ROOT/memory_sidecars/robodojo_v30_r16_s8_v1" \
+  --workers 3
+```
+
+当前版本已经存在，复核时在上述命令后添加 `--validate`，不会重新生成或写入数据。
+变更窗口/步距时使用新的输出版本，并同步设置 `--recent-records`、
+`--decision-stride` 和训练配置；开启 pose 时还需 `--use-pose`。
+
+训练配置 `datasets.vla_data.memory_sidecar_dir` 已指向生成目录。加载器验证
+source symlink、元数据、memory 参数、源文件与严格过去的索引网格，按需 mmap
+当前 episode 的索引；每个 worker 对源 shard 只校验一次。源数据在训练期间应保持
+只读。未配置该目录时保留原有按需计算索引的路径，两条路径使用相同因果约束。
+在线推理仅使用已完成执行反馈构造相同网格，不需要访问离线目录或原始数据集。
 
 ## 训练与 A800 测速
 
 配置：
 `examples/simBenchmarks/RoboDojo/train_files/starvla_robodojo_v30_qwen35_0p8b_spatial_mem.yaml`。
 默认单卡 batch=16、梯度累积=1。Stage A 冻结 Qwen 训练 5k 步；Stage B 从 A 的
-final checkpoint 解冻全模型训练 45k 步。启动器先验证已有空间 sidecar，不生成数据：
+final checkpoint 解冻全模型训练 45k 步。启动器先全量验证 memory 和已有空间
+sidecar，通过后才启动训练，不会自动生成或覆盖数据：
 
 ```bash
 python examples/simBenchmarks/RoboDojo/train_files/run_train_robodojo_spatial_mem.py
@@ -140,4 +166,13 @@ GR00T ZMQ 接口将上述 env_id、episode_id、env_step、memory_feedback 放�
 16 步执行反馈、未来数据隔离、错误协议拒绝、GRU 数值和梯度等价、q99 一致性及
 CUDA autocast/低精度参数。GR00T 协议测试覆盖执行反馈转发与标签过滤。
 
-上述 memory/GR00T 测试连同 config overrides、model tools 回归共 52 项通过。
+预处理测试还覆盖原始文件不变、symlink 挂载、校验值变化、行关联错误、当前/未来
+索引注入拒绝，以及实际 memory 加载器与在线 buffer 的逐帧一致性。
+
+本次 69 项回归测试全部通过。真实数据验证覆盖每个源 shard 的首尾 episode，
+共 6 个 episode、4,286 帧，历史记录逐帧与在线 buffer 完全相等；6 个三相机完整
+样本的当前 state 与 checkpoint 统计驱动的在线 q99 处理完全相等。真实 DataLoader
+以 4 workers、batch=16 完成加载；所有源 parquet 和元数据的验证前后 SHA256
+保持不变，全部 3,500 个索引文件通过校验。结果记录在
+[`robodojo_memory_preprocessing_result.json`](robodojo_memory_preprocessing_result.json)。
+本次仅执行预处理与加载验证，未启动长时间训练。

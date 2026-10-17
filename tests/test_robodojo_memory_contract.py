@@ -186,7 +186,8 @@ def test_spatial_prediction_independent_of_geometry_and_action_labels():
     torch.testing.assert_close(unlabeled, poisoned, atol=0, rtol=0)
 
 
-def test_saved_state_transform_matches_training_pipeline(monkeypatch):
+@pytest.mark.parametrize("raw_dtype", [np.float32, np.float64])
+def test_saved_state_transform_matches_training_pipeline(monkeypatch, raw_dtype):
     from deployment.model_server import policy_norm_processor as serving
     from examples.simBenchmarks.RoboDojo.train_files.data_registry.data_config import RoboDojoArxX5H50Q99DataConfig
     config = RoboDojoArxX5H50Q99DataConfig()
@@ -204,7 +205,7 @@ def test_saved_state_transform_matches_training_pipeline(monkeypatch):
     metadata = serving._build_dataset_metadata(stats, config.embodiment_tag,
         config.action_keys, config.state_keys, config.action_key_dims, config.state_key_dims)
     training_transform.set_metadata(metadata)
-    raw = np.linspace(-3, 5, 14, dtype=np.float32)
+    raw = np.linspace(-3, 5, 14, dtype=raw_dtype)
     data, cursor = {}, 0
     for keys, dims in ((config.state_keys, config.state_key_dims), (config.action_keys, config.action_key_dims)):
         cursor = 0
@@ -212,6 +213,7 @@ def test_saved_state_transform_matches_training_pipeline(monkeypatch):
             data[key] = raw[None, cursor:cursor + dims[key]].copy()
             cursor += dims[key]
     transformed = training_transform(data)
+    assert all(transformed[key].dtype == torch.float32 for key in config.state_keys + config.action_keys)
     expected = torch.cat([transformed[key] for key in config.state_keys], -1).numpy()
     np.testing.assert_array_equal(proc.apply_state(raw), expected)
 

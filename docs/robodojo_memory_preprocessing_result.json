@@ -1,0 +1,32 @@
+{
+  "source_dataset": "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video",
+  "memory_sidecar": "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/memory_sidecars/robodojo_v30_r16_s8_v1",
+  "source_identity_sha256": "b8b59598e98e1268f4920d1a72deee6fa6b9cc12118edcaefaf9cc1271ecfa4f",
+  "total_episodes": 3500,
+  "total_frames": 1856102,
+  "full_index_validation": true,
+  "source_metadata_and_parquet_unchanged": true,
+  "original_data_copied": false,
+  "derived_index_bytes": 119238528,
+  "manifest_bytes": 997408,
+  "online_offline_exact_episodes": [
+    0,
+    1141,
+    1142,
+    2557,
+    2558,
+    3499
+  ],
+  "online_offline_exact_frames": 4286,
+  "packed_three_camera_samples": 6,
+  "saved_q99_serving_parity": true,
+  "dataloader_workers": 4,
+  "dataloader_batch_size": 16,
+  "recent_records": 16,
+  "decision_stride_env_steps": 8,
+  "use_pose": false,
+  "long_training_started": false,
+  "regression_tests_passed": 69,
+  "regression_duration_seconds": 55.9,
+  "validation_date": "2026-10-17"
+}
