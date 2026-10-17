@@ -4,6 +4,7 @@
 # Design and Merged by [Jinhui YE / HKUST University] in [2026].
 
 from typing import Optional
+import os
 
 import torch
 from starVLA.model.tools import get_training_dtype, has_flash_attn  # unified attention/precision helpers
@@ -56,7 +57,10 @@ class _QWen3_5_VL_Interface(nn.Module):
         super().__init__()
 
         qwenvl_config = config.framework.get("qwenvl", {})
-        model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
+        model_id = os.environ.get(
+            "STARVLA_BASE_VLM",
+            qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct"),
+        )
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
 
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
