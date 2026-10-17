@@ -57,9 +57,9 @@ datasets:
     memory_state_dim: 14
     memory_action_dim: 14
     memory_use_pose: false
-    # A V100 32GB fits eight examples for full 0.8B fine-tuning. Accumulation
-    # below preserves an effective batch size of 32 without an OOM.
-    per_device_batch_size: 8
+    # Keep the micro-batch at one: longer video sequences can OOM on a V100
+    # with larger micro-batches during full-parameter fine-tuning.
+    per_device_batch_size: 1
     load_all_data_for_training: false
     obs_image_size: [224, 224]
     video_backend: opencv
@@ -93,7 +93,7 @@ trainer:
   weight_decay: 0.0
   logging_frequency: 10
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
   gradient_checkpointing: true
   optimizer:
     name: AdamW
