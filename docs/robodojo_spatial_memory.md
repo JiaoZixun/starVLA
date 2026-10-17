@@ -42,21 +42,22 @@ Memory 预处理只生成索引和视觉 patch，不复制原始 parquet、视�
 原始数据 adapter 与新增数据应保存在同一目录树中：
 
 ```text
-starvla_robodojo_v30/
-├── RoboDojo_lerobot_v30_video/       # metadata adapter; data/videos link to raw data
+robodojo_spatial_training_bundle/
+├── data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video/
 └── memory_sidecars/robodojo_v30_r16_s8_visual_v2/
     ├── manifest.json
-    ├── source_dataset -> ../../RoboDojo_lerobot_v30_video
+    ├── source_dataset -> ../../data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video
     └── episodes/
         ├── 000000.npy                # int32 [episode_length, 16]
         ├── 000000.visual.npy         # uint8 [episode_length, 3, 8, 8, 8, 3]
         └── ...
 ```
 
-`source_dataset`、manifest 中的 source 路径，以及 adapter 下指向原始数据的链接
-都使用相对路径。移动到服务器时保留这棵目录树，原始数据和 sidecar 会继续对应；
+`source_dataset`、manifest 中的 source 路径，以及数据 adapter 下指向原始数据的链接
+都使用相对路径。把 sidecar 上传到训练 bundle 的 `memory_sidecars/` 并保留版本目录，
+链接会指向服务器已有的原始数据 adapter；
 加载器还会校验 metadata 和 parquet SHA256，源数据不匹配时拒绝训练。当前机器
-生成目录为 `/home/data/robodojo_cache/starvla_robodojo_v30/memory_sidecars/robodojo_v30_r16_s8_visual_v2`。
+生成目录为 `/home/data/robodojo_cache/robodojo_spatial_training_bundle_20261013/memory_sidecars/robodojo_v30_r16_s8_visual_v2`。
 
 索引 `.npy` 只保存严格过去的帧索引；无效位置为 -1；visual `.npy` 保存每帧三路
 patch。训练加载器按 episode 和
@@ -72,9 +73,9 @@ memory 参数及每个 episode 的源 shard/起止行与索引文件校验值。
 仓库根目录、安装 pandas/pyarrow/numpy 的 Python 环境中执行（路径按实际部署设置）：
 
 ```bash
-export ROBODOJO_SPATIAL_ROOT=/home/data/robodojo_cache/starvla_robodojo_v30
+export ROBODOJO_SPATIAL_ROOT=/home/data/robodojo_cache/robodojo_spatial_training_bundle_20261013
 PYTHONPATH=. python examples/simBenchmarks/RoboDojo/train_files/prepare_memory_sidecar.py \
-  --data-root "$ROBODOJO_SPATIAL_ROOT/RoboDojo_lerobot_v30_video" \
+  --data-root "$ROBODOJO_SPATIAL_ROOT/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video" \
   --sidecar "$ROBODOJO_SPATIAL_ROOT/memory_sidecars/robodojo_v30_r16_s8_visual_v2" \
   --workers 3
 ```
