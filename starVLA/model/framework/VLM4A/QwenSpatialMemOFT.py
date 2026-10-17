@@ -14,7 +14,9 @@ from torch import nn
 
 from starVLA.model.framework.VLM4A.QwenSpatialOFT import QwenSpatialOFT
 from starVLA.model.tools import FRAMEWORK_REGISTRY
-from starVLA.utils.robodojo_memory import RoboDojoMemorySpec
+from starVLA.utils.robodojo_memory import (
+    MEMORY_VISUAL_SHAPE, RoboDojoMemorySpec,
+)
 
 
 class CausalExecutionMemory(nn.Module):
@@ -29,19 +31,31 @@ class CausalExecutionMemory(nn.Module):
         width: int = 256,
         heads: int = 4,
         layers: int = 2,
+        slots: int = 8,
+        detach_every: int = 8,
+        record_dropout: float = 0.0,
     ):
         super().__init__()
         self.width = int(width)
         self.state_dim, self.action_dim, self.pose_dim = int(state_dim), int(action_dim), int(pose_dim)
+        self.slots = int(slots)
+        self.detach_every = max(1, int(detach_every))
+        self.record_dropout = float(record_dropout)
+        # Flatten all camera views and patches into one shared record feature.
+        visual_dim = int(np.prod(MEMORY_VISUAL_SHAPE))
+        self.visual_projection = nn.Sequential(
+            nn.LayerNorm(visual_dim), nn.Linear(visual_dim, self.width), nn.GELU(), nn.Linear(self.width, self.width)
+        )
         self.record_projection = nn.Sequential(
             nn.LayerNorm(self.state_dim + self.action_dim + self.pose_dim + 1),
             nn.Linear(self.state_dim + self.action_dim + self.pose_dim + 1, self.width),
             nn.GELU(),
             nn.Linear(self.width, self.width),
         )
-        self.slot_seed = nn.Parameter(torch.empty(8, self.width))
+        self.record_norm = nn.LayerNorm(self.width)
+        self.slot_seed = nn.Parameter(torch.empty(self.slots, self.width))
         nn.init.normal_(self.slot_seed, mean=0.0, std=0.02)
-        self.slot_update = nn.GRU(self.width, self.width, batch_first=True)
+        self.slot_update = nn.GRUCell(self.width, self.width)
         self.retrieval_query = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, self.width))
         self.retrieval_layers = nn.ModuleList(
             [nn.MultiheadAttention(self.width, heads, batch_first=True) for _ in range(int(layers))]
@@ -49,8 +63,8 @@ class CausalExecutionMemory(nn.Module):
         self.retrieval_norms = nn.ModuleList([nn.LayerNorm(self.width) for _ in range(int(layers))])
         self.output_projection = nn.Linear(self.width, hidden_size)
         self.gate = nn.Sequential(
-            nn.LayerNorm(hidden_size + self.width),
-            nn.Linear(hidden_size + self.width, self.width),
+            nn.LayerNorm(hidden_size + self.width + 1),
+            nn.Linear(hidden_size + self.width + 1, self.width),
             nn.Sigmoid(),
         )
         # Preserve the spatial checkpoint's action path at initialization.
@@ -58,6 +72,10 @@ class CausalExecutionMemory(nn.Module):
         nn.init.zeros_(self.output_projection.bias)
 
     def _record_features(self, records: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        visual = torch.as_tensor(records["visual_tokens"], device=device)
+        if visual.ndim != 7 or tuple(visual.shape[-5:]) != MEMORY_VISUAL_SHAPE:
+            raise ValueError(f"Memory visual tokens must be [B,R,{MEMORY_VISUAL_SHAPE}], got {tuple(visual.shape)}")
+        visual = self.visual_projection(visual.float().div(255.0).flatten(start_dim=2))
         state = torch.as_tensor(records["state"], device=device, dtype=torch.float32)
         action = torch.as_tensor(records["executed_actions"], device=device, dtype=torch.float32)
         elapsed = torch.as_tensor(records["elapsed_env_steps"], device=device, dtype=torch.float32).unsqueeze(-1)
@@ -73,27 +91,18 @@ class CausalExecutionMemory(nn.Module):
         # parameters. Match that dtype before normalization; training keeps
         # FP32 master parameters and still uses autocast for the linear/GRU path.
         values = torch.cat(values, dim=-1).to(self.record_projection[0].weight.dtype)
-        record = self.record_projection(values)
+        record = self.record_norm(self.record_projection(values) + visual)
         valid = torch.as_tensor(records["valid_mask"], device=device, dtype=torch.bool)
         return record, valid
 
     def _update_slots(self, slots: torch.Tensor, records: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        # Right-aligned padding -> left-aligned sequences. Run all eight slots
-        # and all history steps in one cuDNN GRU, then gather each last valid
-        # output. This is equivalent to skipping padded GRUCell updates, with
-        # no Python loop over history or GPU->CPU length synchronization.
-        batch, length, width = records.shape
-        count = valid.sum(1)
-        indices = (torch.arange(length, device=records.device)[None] + length - count[:, None]) % length
-        compact = records.gather(1, indices[..., None].expand(-1, -1, width))
-        nslots = slots.shape[1]
-        inputs = compact[:, None].expand(-1, nslots, -1, -1).reshape(batch * nslots, length, width).contiguous()
-        initial = slots.reshape(1, batch * nslots, width).contiguous()
-        outputs, _ = self.slot_update(inputs, initial)
-        outputs = outputs.view(batch, nslots, length, width)
-        last = (count - 1).clamp_min(0)[:, None, None, None].expand(-1, nslots, 1, width)
-        updated = outputs.gather(2, last).squeeze(2)
-        return torch.where((count > 0)[:, None, None], updated, slots)
+        batch = records.shape[0]
+        for index in range(records.shape[1]):
+            active = valid[:, index].view(batch, 1, 1)
+            inputs = records[:, index].unsqueeze(1).expand(-1, slots.shape[1], -1)
+            updated = self.slot_update(inputs.reshape(-1, self.width), slots.reshape(-1, self.width)).view_as(slots)
+            slots = torch.where(active, updated, slots)
+        return slots
 
     def forward(
         self,
@@ -108,9 +117,17 @@ class CausalExecutionMemory(nn.Module):
         if record.shape[0] != batch:
             raise ValueError(f"Memory batch mismatch: records={record.shape[0]} queries={batch}")
         slots = self.slot_seed.unsqueeze(0).expand(batch, -1, -1)
+        if self.training and self.record_dropout:
+            valid = valid & (torch.rand_like(valid.float()) >= self.record_dropout)
         if burnin_records is not None:
-            raise ValueError("RoboDojo uses a bounded window; external burn-in is forbidden")
-        slots = self._update_slots(slots, record, valid)
+            with torch.no_grad():
+                burn, burn_valid = self._record_features(burnin_records, action_queries.device)
+                slots = self._update_slots(slots, burn, burn_valid)
+            slots = slots.detach()
+        for start in range(0, record.shape[1], self.detach_every):
+            slots = self._update_slots(slots, record[:, start:start + self.detach_every], valid[:, start:start + self.detach_every])
+            if start + self.detach_every < record.shape[1]:
+                slots = slots.detach()
         retrieval = torch.cat((record, slots), dim=1)
         retrieval_valid = torch.cat(
             (valid, torch.ones((batch, slots.shape[1]), device=valid.device, dtype=torch.bool)), dim=1
@@ -121,7 +138,9 @@ class CausalExecutionMemory(nn.Module):
             query = norm(query + update)
         summary = query.mean(dim=1)
         # One gate per query controls the residual. No labels enter this path.
-        gate = self.gate(torch.cat((action_queries, query), dim=-1))
+        elapsed_summary = torch.as_tensor(records["elapsed_env_steps"], device=action_queries.device, dtype=torch.float32)
+        elapsed_summary = (elapsed_summary * valid.float()).sum(1, keepdim=True) / valid.float().sum(1, keepdim=True).clamp_min(1)
+        gate = self.gate(torch.cat((action_queries, query, elapsed_summary[:, None].expand(-1, query.shape[1], -1) / 128.0), dim=-1))
         conditioned = action_queries + self.output_projection(gate * query)
         return conditioned, summary, gate.detach().float().mean()
 
@@ -142,6 +161,8 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         self.memory_state_dim = int(memory.get("state_dim", 14))
         self.memory_action_dim = int(memory.get("action_dim", 14))
         self.memory_use_pose = bool(memory.get("use_pose", False))
+        self.memory_bptt_records = int(memory.get("bptt_records", memory.get("detach_every", 8)))
+        self.memory_dropout = float(memory.get("dropout", memory.get("record_dropout", 0.0)))
         self.memory_spec = RoboDojoMemorySpec(self.memory_recent_records, self.memory_decision_stride, self.memory_use_pose)
         if self.memory_state_dim != 14 or self.memory_action_dim != 14:
             raise ValueError("RoboDojo memory requires state_dim=action_dim=14")
@@ -157,6 +178,9 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             heads=int(memory.get("heads", spatial.get("memory_heads", 4))),
             layers=int(memory.get("layers", spatial.get("memory_layers", 2))),
             pose_dim=32 if self.memory_use_pose else 0,
+            slots=int(memory.get("slots", 8)),
+            detach_every=self.memory_bptt_records,
+            record_dropout=self.memory_dropout,
         )
         self.memory_waypoint_projection = nn.Linear(self.execution_memory.width, hidden_size)
         nn.init.zeros_(self.memory_waypoint_projection.weight)
@@ -172,14 +196,28 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             raise ValueError("QwenSpatialMemOFT requires causal memory_records for every example")
         records = [e["memory_records"] for e in examples]
         for example in examples:
-            if example.get("memory_burnin_records") is not None:
-                raise ValueError("External burn-in is forbidden for bounded RoboDojo memory")
             contract = example.get("memory_contract")
             if not isinstance(contract, dict):
                 raise ValueError("Every memory sample requires memory_contract")
             self.memory_spec.validate(example["memory_records"], contract)
         keys = tuple(self.memory_spec.empty())
-        return {key: np.stack([r[key] for r in records]) for key in keys}, None
+        recent = {key: np.stack([r[key] for r in records]) for key in keys}
+        burnins = [e.get("memory_burnin_records") for e in examples]
+        if all(b is None for b in burnins):
+            return recent, None
+        if any(not isinstance(b, dict) for b in burnins):
+            raise ValueError("Every memory sample must provide memory_burnin_records")
+        max_len = max(len(b["valid_mask"]) for b in burnins)
+        burn = {}
+        for key in keys:
+            value = np.asarray(burnins[0][key])
+            arr = np.zeros((len(examples), max_len, *value.shape[1:]), dtype=value.dtype)
+            for index, b in enumerate(burnins):
+                if np.asarray(b[key]).shape[1:] != value.shape[1:]:
+                    raise ValueError(f"Inconsistent burn-in field {key}")
+                arr[index, :len(b["valid_mask"])] = b[key]
+            burn[key] = arr
+        return recent, burn
 
     def _spatial_forward(self, hidden, action_hidden, examples):
         records, burnin = self._batch_memory_records(examples)

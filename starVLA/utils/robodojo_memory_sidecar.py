@@ -12,10 +12,11 @@ import os
 from pathlib import Path
 import shutil
 import uuid
+from functools import lru_cache
 
 import numpy as np
 
-from starVLA.utils.robodojo_memory import RoboDojoMemorySpec
+from starVLA.utils.robodojo_memory import MEMORY_VISUAL_SHAPE, image_to_memory_tokens, RoboDojoMemorySpec
 
 
 CAMERAS = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
@@ -29,6 +30,12 @@ def sha256(path):
         for block in iter(lambda: stream.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+@lru_cache(maxsize=1024)
+def _cached_sha256(path):
+    """Hash each immutable source video at most once per preprocessing run."""
+    return sha256(Path(path))
 
 
 def history_indices(length, spec):
@@ -72,7 +79,81 @@ def _source_metadata(source):
     return info
 
 
-def _build_file(source, path, target, spec):
+def _episode_metadata(source):
+    import pandas as pd
+    files = sorted((source / "meta/episodes").glob("chunk-*/*.parquet"))
+    if not files:
+        return {}
+    table = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
+    return {int(row["episode_index"]): row.to_dict() for _, row in table.iterrows()}
+
+
+def _video_path(source, camera, chunk, file_index):
+    return source / "videos" / f"observation.images.{camera}" / f"chunk-{int(chunk):03d}" / f"file-{int(file_index):03d}.mp4"
+
+
+def _decode_episode_visual(source, metadata, episode, length):
+    """Decode the three AV1 streams and create the shared uint8 patch tensor."""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError("PyAV is required to preprocess RoboDojo visual memory sidecars") from exc
+    output = np.empty((length, *MEMORY_VISUAL_SHAPE), dtype=np.uint8)
+    hashes = {}
+    for camera in CAMERAS:
+        prefix = f"videos/observation.images.{camera}/"
+        path = _video_path(source, camera, metadata[f"videos/observation.images.{camera}/chunk_index"],
+                           metadata[f"videos/observation.images.{camera}/file_index"])
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing source video for episode {episode}: {path}")
+        # RoboDojo stores many episodes in one long video file.  Cache the
+        # immutable-file hash so adjacent episodes do not rescan the same
+        # multi-gigabyte source over and over.
+        hashes[camera] = _cached_sha256(str(path))
+        start_ts = float(metadata[f"videos/observation.images.{camera}/from_timestamp"])
+        container = av.open(str(path))
+        try:
+            stream = container.streams.video[0]
+            rate = float(stream.average_rate or 25.0)
+            start = max(0, int(round(start_ts * rate)))
+            # Seek to the keyframe before this episode instead of decoding
+            # the complete preceding history in the same source video.
+            # The timestamp is expressed in the stream's own time base.
+            target_pts = int(round(start_ts / float(stream.time_base)))
+            try:
+                container.seek(target_pts, stream=stream, backward=True, any_frame=False)
+                seeked = True
+            except (av.error.FFmpegError, ValueError, TypeError):
+                seeked = False
+            decoded = 0
+            seen = 0
+            for index, frame in enumerate(container.decode(stream)):
+                if seeked:
+                    # Seek lands on a preceding keyframe.  Drop frames before
+                    # the requested episode boundary using exact PTS when
+                    # available; frame-count fallback covers unusual codecs.
+                    if frame.pts is not None:
+                        if frame.pts < target_pts:
+                            continue
+                    elif seen < start:
+                        seen += 1
+                        continue
+                elif index < start:
+                    continue
+                if decoded >= length:
+                    break
+                rgb = frame.to_ndarray(format="rgb24")
+                output[decoded, CAMERAS.index(camera)] = image_to_memory_tokens(rgb)
+                decoded += 1
+                seen += 1
+        finally:
+            container.close()
+        if decoded != length:
+            raise ValueError(f"Video frame count for episode {episode}/{camera}: {decoded} != {length}")
+    return output, hashes
+
+
+def _build_file(source, path, target, spec, episode_meta=None, visual=False):
     import pandas as pd
 
     before = path.stat()
@@ -99,10 +180,22 @@ def _build_file(source, path, target, spec):
         # Fail on duplicates, including episodes split between source shards.
         with destination.open("xb") as stream:
             np.save(stream, history_indices(length, spec), allow_pickle=False)
+        visual_meta = None
+        if visual:
+            if episode_meta is None or episode not in episode_meta:
+                raise ValueError(f"Missing episode metadata for visual episode {episode}")
+            visual_values, video_hashes = _decode_episode_visual(source, episode_meta[episode], episode, length)
+            visual_destination = target / f"episodes/{episode:06d}.visual.npy"
+            with visual_destination.open("xb") as stream:
+                np.save(stream, visual_values, allow_pickle=False)
+            visual_meta = {"file": str(visual_destination.relative_to(target)), "sha256": sha256(visual_destination),
+                           "visual_shape": list(visual_values.shape[1:]), "visual_dtype": "uint8",
+                           "video_sha256": video_hashes}
         episodes[str(episode)] = {
             "length": length, "file": name, "sha256": sha256(destination),
             "source_file": relative, "source_row_start": int(rows[0]),
             "source_row_stop": int(rows[-1] + 1),
+            **({"visual": visual_meta} if visual_meta else {}),
         }
     digest = sha256(path)
     after = path.stat()
@@ -111,7 +204,7 @@ def _build_file(source, path, target, spec):
     return relative, {"sha256": digest, "size_bytes": after.st_size, "rows": len(data)}, episodes
 
 
-def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3):
+def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=True):
     """Publish a complete version atomically; never edit/duplicate source data."""
     source, output = Path(source).resolve(), Path(output).absolute()
     if output.resolve().is_relative_to(source):
@@ -133,8 +226,14 @@ def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3):
         metadata_names += [name for name in ("meta/stats.json", "meta/stats_gr00t.json", "meta/tasks.parquet")
                            if (source / name).is_file()]
         metadata_names += [str(p.relative_to(source)) for p in sorted((source / "meta/episodes").glob("chunk-*/*.parquet"))]
+        episode_meta = _episode_metadata(source) if visual else {}
+        has_visual = visual and bool(episode_meta) and all((_video_path(source, camera,
+            next(iter(episode_meta.values()))[f"videos/observation.images.{camera}/chunk_index"],
+            next(iter(episode_meta.values()))[f"videos/observation.images.{camera}/file_index"])).exists() for camera in CAMERAS)
+        # Small synthetic/index-only fixtures have no videos; retain v1 behavior for them.
+        visual = bool(has_visual)
         manifest = {
-            "format": "robodojo_causal_memory_indices", "format_version": 1,
+            "format": "robodojo_causal_memory_indices", "format_version": 2 if visual else 1,
             "source": str(source), "source_link": "source_dataset",
             "representation": REPRESENTATION, "channel_order": CHANNELS, "camera_order": CAMERAS,
             "recent_records": spec.recent_records, "decision_stride_env_steps": spec.decision_stride,
@@ -144,8 +243,11 @@ def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3):
             "metadata_sha256": {name: sha256(source / name) for name in metadata_names},
             "source_files": {}, "episodes": {},
         }
+        if visual:
+            manifest.update({"visual_shape": list(MEMORY_VISUAL_SHAPE), "visual_dtype": "uint8",
+                             "visual_encoding": "ordered_rgb_2x4_box_8x8", "visual_sidecar": True})
         with ThreadPoolExecutor(max_workers=min(workers, len(files))) as pool:
-            results = pool.map(lambda path: _build_file(source, path, temporary, spec), files)
+            results = pool.map(lambda path: _build_file(source, path, temporary, spec, episode_meta, visual), files)
             for relative, meta, episodes in results:
                 if manifest["episodes"].keys() & episodes.keys():
                     raise ValueError("Episode spans multiple source shards")
@@ -175,8 +277,9 @@ class RoboDojoMemorySidecar:
         self.root, self.source, self.spec = Path(root).resolve(), Path(source).resolve(), spec
         self.manifest = json.loads((self.root / "manifest.json").read_text())
         m = self.manifest
-        if (m.get("format"), m.get("format_version"), m.get("representation"), m.get("padding")) != (
-                "robodojo_causal_memory_indices", 1, REPRESENTATION, -1):
+        if (m.get("format"), m.get("format_version"), m.get("representation"), m.get("padding")) not in (
+                ("robodojo_causal_memory_indices", 1, REPRESENTATION, -1),
+                ("robodojo_causal_memory_indices", 2, REPRESENTATION, -1)):
             raise ValueError("Unsupported memory sidecar format")
         if (m.get("recent_records"), m.get("decision_stride_env_steps"), m.get("use_pose")) != (
                 spec.recent_records, spec.decision_stride, spec.use_pose):
@@ -193,6 +296,12 @@ class RoboDojoMemorySidecar:
         self._verified_sources = set()
         self._episode = None
         self._indices = None
+        self.visual = bool(m.get("format_version") == 2 and m.get("visual_sidecar"))
+        if self.visual:
+            if m.get("camera_order") != CAMERAS or m.get("visual_shape") != list(MEMORY_VISUAL_SHAPE):
+                raise ValueError("Visual memory manifest shape/camera contract differs")
+            if m.get("visual_dtype") != "uint8" or m.get("visual_encoding") != "ordered_rgb_2x4_box_8x8":
+                raise ValueError("Unsupported visual memory encoding")
 
     def indices(self, episode, length):
         if self._episode == episode:
@@ -216,6 +325,23 @@ class RoboDojoMemorySidecar:
             raise ValueError("Memory indices violate the strictly-past stride grid")
         self._episode, self._indices = episode, indices
         return indices
+
+    def visual_tokens(self, episode, length):
+        if not self.visual:
+            return np.zeros((length, *MEMORY_VISUAL_SHAPE), dtype=np.uint8)
+        entry = self.manifest["episodes"][str(int(episode))]
+        if int(entry["length"]) != int(length):
+            raise ValueError("Memory visual episode length differs from source")
+        visual_entry = entry.get("visual")
+        if not visual_entry:
+            raise ValueError("Visual memory entry missing")
+        path = _inside(self.root, visual_entry["file"])
+        if sha256(path) != visual_entry["sha256"]:
+            raise ValueError(f"Memory visual sidecar changed: {path}")
+        values = np.load(path, mmap_mode="r", allow_pickle=False)
+        if values.dtype != np.uint8 or tuple(values.shape) != (length, *MEMORY_VISUAL_SHAPE):
+            raise ValueError(f"Invalid memory visual sidecar shape/dtype: {values.shape}/{values.dtype}")
+        return values
 
 
 def validate_sidecar(root, source, spec=RoboDojoMemorySpec()):
@@ -241,6 +367,16 @@ def validate_sidecar(root, source, spec=RoboDojoMemorySpec()):
                     group["frame_index"].to_numpy(), np.arange(entry["length"])):
                 raise ValueError("Episode/frame links do not match original source rows")
             reader.indices(int(episode), entry["length"])
+            if reader.visual:
+                visual_entry = entry.get("visual")
+                if not visual_entry:
+                    raise ValueError(f"Episode {episode} is missing visual memory metadata")
+                visual_path = _inside(reader.root, visual_entry["file"])
+                if sha256(visual_path) != visual_entry["sha256"]:
+                    raise ValueError(f"Memory visual sidecar changed: {visual_path}")
+                values = np.load(visual_path, mmap_mode="r", allow_pickle=False)
+                if values.dtype != np.uint8 or tuple(values.shape) != (entry["length"], *MEMORY_VISUAL_SHAPE):
+                    raise ValueError(f"Invalid memory visual sidecar shape/dtype for episode {episode}: {values.shape}/{values.dtype}")
             covered[start:stop] = True
             total += entry["length"]
         if not covered.all():

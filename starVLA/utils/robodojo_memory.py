@@ -6,8 +6,47 @@ may enter memory only after environment step t has completed.
 """
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
+
+MEMORY_PATCH_ROWS = 2
+MEMORY_PATCH_COLS = 4
+MEMORY_VISUAL_TOKENS = MEMORY_PATCH_ROWS * MEMORY_PATCH_COLS
+MEMORY_PATCH_SIZE = 8
+MEMORY_VISUAL_VIEWS = 3
+MEMORY_VISUAL_FEATURE_DIM = 3
+MEMORY_VISUAL_SHAPE = (MEMORY_VISUAL_VIEWS, MEMORY_VISUAL_TOKENS, MEMORY_PATCH_SIZE, MEMORY_PATCH_SIZE, MEMORY_VISUAL_FEATURE_DIM)
+
+
+def image_to_memory_tokens(image: Any) -> np.ndarray:
+    """Convert an RGB frame to the shared ordered 2x4 8x8 uint8 patch contract."""
+    from PIL import Image
+    if isinstance(image, Image.Image):
+        rgb = image.convert("RGB")
+    else:
+        value = np.asarray(image)
+        if value.ndim != 3 or value.shape[-1] != 3:
+            raise ValueError(f"Expected RGB image [H,W,3], got {value.shape}")
+        if value.dtype != np.uint8:
+            if not np.issubdtype(value.dtype, np.number) or not np.isfinite(value).all():
+                raise ValueError("RGB image must contain finite numeric values")
+            value = np.clip(value, 0, 255).astype(np.uint8)
+        rgb = Image.fromarray(value, mode="RGB")
+    width, height = rgb.size
+    patch_width, patch_height = width // MEMORY_PATCH_COLS, height // MEMORY_PATCH_ROWS
+    if patch_width < 1 or patch_height < 1:
+        raise ValueError(f"RGB image is too small for 2x4 patches: {rgb.size}")
+    result = np.empty((MEMORY_VISUAL_TOKENS, MEMORY_PATCH_SIZE, MEMORY_PATCH_SIZE, 3), np.uint8)
+    slot = 0
+    for row in range(MEMORY_PATCH_ROWS):
+        for col in range(MEMORY_PATCH_COLS):
+            crop = rgb.crop((col * patch_width, row * patch_height,
+                             width if col == MEMORY_PATCH_COLS - 1 else (col + 1) * patch_width,
+                             height if row == MEMORY_PATCH_ROWS - 1 else (row + 1) * patch_height))
+            result[slot] = np.asarray(crop.resize((MEMORY_PATCH_SIZE, MEMORY_PATCH_SIZE), Image.Resampling.BOX), dtype=np.uint8)
+            slot += 1
+    return result
 
 
 @dataclass(frozen=True)
@@ -28,6 +67,7 @@ class RoboDojoMemorySpec:
 
     def empty(self) -> dict:
         result = {
+            "visual_tokens": np.zeros((self.recent_records, *MEMORY_VISUAL_SHAPE), np.uint8),
             "state": np.zeros((self.recent_records, 14), np.float32),
             "executed_actions": np.zeros((self.recent_records, 14), np.float32),
             "elapsed_env_steps": np.zeros(self.recent_records, np.float32),
@@ -78,7 +118,7 @@ class RoboDojoMemorySpec:
         elapsed = np.asarray(record["elapsed_env_steps"])
         if not np.array_equal(elapsed, np.where(valid, current - indices, 0)):
             raise ValueError("Memory elapsed steps disagree with source indices")
-        for key in ("state", "executed_actions", "eef_pose"):
+        for key in ("state", "executed_actions", "visual_tokens", "eef_pose"):
             if key in record and np.any(np.asarray(record[key])[~valid] != 0):
                 raise ValueError("Invalid memory slots must be zero")
 
@@ -107,7 +147,7 @@ class RoboDojoMemoryBuffer:
         self.records.clear()
         self.next_source_step = 0
 
-    def append(self, state, executed_action, *, source_step: int, pose=None):
+    def append(self, state, executed_action, *, source_step: int, pose=None, images=None, visual_tokens=None):
         self.spec.indices(source_step)
         if source_step != self.next_source_step:
             raise ValueError(f"Execution feedback must cover every step in order; expected {self.next_source_step}")
@@ -116,6 +156,13 @@ class RoboDojoMemoryBuffer:
             "executed_actions": finite_array(executed_action, (14,), "executed action"),
             "source_step": int(source_step),
         }
+        if visual_tokens is None:
+            visual_tokens = (np.stack([image_to_memory_tokens(image) for image in images])
+                             if images is not None else np.zeros(MEMORY_VISUAL_SHAPE, np.uint8))
+        visual_tokens = np.asarray(visual_tokens)
+        if visual_tokens.shape != MEMORY_VISUAL_SHAPE or visual_tokens.dtype != np.uint8:
+            raise ValueError(f"visual_tokens must be uint8 {MEMORY_VISUAL_SHAPE}, got {visual_tokens.shape}/{visual_tokens.dtype}")
+        record["visual_tokens"] = visual_tokens.copy()
         if self.spec.use_pose:
             record["eef_pose"] = finite_array(pose, (2, 4, 4), "dual-arm FK pose")
         elif pose is not None:
@@ -132,10 +179,29 @@ class RoboDojoMemoryBuffer:
             if step < 0:
                 continue
             record = by_step[int(step)]
-            for key in ("state", "executed_actions", "eef_pose"):
+            for key in ("state", "executed_actions", "visual_tokens", "eef_pose"):
                 if key in result:
                     result[key][slot] = record[key]
             result["valid_mask"][slot] = True
             result["source_frame_index"][slot] = step
             result["elapsed_env_steps"][slot] = current_step - step
+        return result
+
+    def build_burnin(self, current_step: int) -> dict:
+        """Return committed stride records before the recent memory window."""
+        current_step = int(current_step)
+        cutoff = max(0, current_step - self.spec.decision_stride * self.spec.recent_records)
+        records = [r for r in self.records if r["source_step"] < cutoff]
+        template = self.spec.empty()
+        result = {}
+        for key, value in template.items():
+            shape = (len(records), *value.shape[1:])
+            if records:
+                result[key] = np.stack([r[key] if key in r else value[0] for r in records]).astype(value.dtype, copy=False)
+            else:
+                result[key] = np.zeros(shape, dtype=value.dtype)
+        for index, record in enumerate(records):
+            result["valid_mask"][index] = True
+            result["source_frame_index"][index] = record["source_step"]
+            result["elapsed_env_steps"][index] = self.spec.decision_stride
         return result

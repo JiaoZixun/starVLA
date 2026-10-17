@@ -12,7 +12,8 @@ learned slots、gated retrieval 和 waypoint conditioning，保留当前 RoboDoj
   保存的训练 q99 transform，在线端复用同一实现。parquet 中的 float64 state/action
   在 q99 前统一为 float32，与在线输入精度一致，避免打包后才转换造成数值偏差。
 - 当前图像顺序为 `cam_high, cam_left_wrist, cam_right_wrist`，分辨率 224×224。
-  不重复解码或编码历史图像。
+  历史每路图像预处理为有序 2×4 个 8×8 RGB patch（`uint8`），训练和在线端共用
+  `image_to_memory_tokens`，不重复解码模型视觉输入。
 - 默认在当前环境步 `t` 采样 `t - 8 × [16, 15, ..., 1]`，负索引以零填充。
   离线 parquet 与在线反馈使用同一 `RoboDojoMemorySpec`。
 - 一条记录为执行第 `s` 步之前的 raw state、第 `s` 步实际执行的 command，以及
@@ -40,17 +41,19 @@ persistent workers、pin memory 和预取。训练使用 SDPA、自动 BF16（�
 已对当前 RoboDojo v3 全量数据完成 memory 预处理：3,500 个 episode、
 1,856,102 帧。原始数据位于
 `/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video`。
-新增数据独立存储在同一 bundle 的 `memory_sidecars/robodojo_v30_r16_s8_v1`：
+新增数据独立存储在同一 bundle 的 `memory_sidecars/robodojo_v30_r16_s8_visual_v2`：
 
 ```text
-memory_sidecars/robodojo_v30_r16_s8_v1/
+memory_sidecars/robodojo_v30_r16_s8_visual_v2/
     manifest.json
     source_dataset -> ../../data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video
     episodes/000000.npy                    # int32 [episode_length, 16]
+    episodes/000000.visual.npy             # uint8 [episode_length, 3, 8, 8, 8, 3]
     ...
 ```
 
-每个 `.npy` 只保存严格过去的帧索引；无效位置为 -1。训练加载器按 episode 和
+索引 `.npy` 只保存严格过去的帧索引；无效位置为 -1；visual `.npy` 保存每帧三路
+patch。训练加载器按 episode 和
 frame index 从原始 parquet 一次 gather 原始 14D state/action，不复制视频、
 state/action 或归一化统计，也不缓存未来标签。索引总量约 114 MiB；空间监督继续
 使用已有独立 `spatial_sidecar_dir`。默认 `use_pose=false`，没有生成额外 pose。
@@ -66,7 +69,7 @@ memory 参数及每个 episode 的源 shard/起止行与索引文件校验值。
 export ROBODOJO_SPATIAL_ROOT=/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013
 PYTHONPATH=. python examples/simBenchmarks/RoboDojo/train_files/prepare_memory_sidecar.py \
   --data-root "$ROBODOJO_SPATIAL_ROOT/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video" \
-  --sidecar "$ROBODOJO_SPATIAL_ROOT/memory_sidecars/robodojo_v30_r16_s8_v1" \
+  --sidecar "$ROBODOJO_SPATIAL_ROOT/memory_sidecars/robodojo_v30_r16_s8_visual_v2" \
   --workers 3
 ```
 
@@ -143,7 +146,8 @@ example["env_step"] = 16
 example["raw_state"] = current_raw_qpos_14
 example["memory_feedback"] = [
     {"source_step": s, "state": raw_state_before_step[s],
-     "executed_action": actual_command_sent_to_robot[s]}
+     "executed_action": actual_command_sent_to_robot[s],
+     "images": [cam_high[s], cam_left_wrist[s], cam_right_wrist[s]]}
     for s in range(16)
 ]
 ```

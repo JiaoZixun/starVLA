@@ -81,7 +81,7 @@ class PolicyServerWrapper:
         if model_cfg.get("framework", {}).get("name") == "QwenSpatialMemOFT":
             self._memory_sessions = RoboDojoMemorySessions(RoboDojoMemorySpec(
                 int(memory.get("recent_records", 16)), int(memory.get("decision_stride_env_steps", 8)),
-                bool(memory.get("use_pose", False))))
+                bool(memory.get("use_pose", False))), require_visual=True)
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]
@@ -169,7 +169,8 @@ class PolicyServerWrapper:
             base["execution_memory"] = {
                 "recent_records": spec.recent_records, "stride": spec.decision_stride, "use_pose": spec.use_pose,
                 "required_fields": ["env_id", "episode_id", "env_step", "raw_state", "memory_feedback"],
-                "feedback": "Every completed environment step: source_step, raw state[14], actual executed_action[14]",
+                "feedback": "Every completed environment step: source_step, raw state[14], actual executed_action[14], and images[cam_high,cam_left_wrist,cam_right_wrist] or visual_tokens",
+                "camera_order": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
                 "representation": "raw_dual_arm_abs_qpos_v1",
             }
         return base

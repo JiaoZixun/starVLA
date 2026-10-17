@@ -37,6 +37,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _GR00T_LANGUAGE_KEY = "annotation.human.task_description"
+_ROBODOJO_CAMERA_ORDER = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 
 def _latest_frame(value: Any, dim: int, key: str) -> np.ndarray:
@@ -172,7 +173,13 @@ class Gr00tCompatPolicy:
         video = observation.get("video")
         if not isinstance(video, dict) or not video:
             raise KeyError("observation is missing the 'video' modality dict")
-        images = [_latest_image(v) for v in video.values()]
+        # RoboDojo's visual memory contract is positional.  Preserve the
+        # canonical camera order whenever the wire keys identify that robot;
+        # dictionary insertion order is not a reliable camera contract.
+        if set(_ROBODOJO_CAMERA_ORDER).issubset(video):
+            images = [_latest_image(video[name]) for name in _ROBODOJO_CAMERA_ORDER]
+        else:
+            images = [_latest_image(v) for v in video.values()]
 
         example: Dict[str, Any] = {
             "image": images,

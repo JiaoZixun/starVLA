@@ -14,6 +14,9 @@ framework:
   action_model:
     action_model_type: MLP
     action_dim: 14
+    slots: 8
+    bptt_records: 8
+    dropout: 0.0
     state_dim: 14
     action_horizon: 50
     hidden_size: 1024
@@ -63,12 +66,16 @@ datasets:
     persistent_workers: true
     prefetch_factor: 4
     memory_enabled: true
-    memory_sidecar_dir: /public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/memory_sidecars/robodojo_v30_r16_s8_v1
+    memory_sidecar_dir: /public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/memory_sidecars/robodojo_v30_r16_s8_visual_v2
     memory_recent_records: 16
     memory_decision_stride: 8
     memory_state_dim: 14
     memory_action_dim: 14
     memory_use_pose: false
+    memory_bptt_records: 8
+    memory_visual_tokens: 8
+    memory_visual_views: 3
+    memory_dropout: 0.0
 
 trainer:
   max_train_steps: 5000

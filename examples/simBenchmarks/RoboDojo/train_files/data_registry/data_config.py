@@ -104,7 +104,8 @@ class RoboDojoArxX5H50Q99DataConfig:
             dataset_cls = LeRobotSingleDataset
         memory_keys = {
             "memory_recent_records", "memory_decision_stride", "memory_state_dim",
-            "memory_action_dim", "memory_use_pose",
+            "memory_action_dim", "memory_use_pose", "memory_bptt_records",
+            "memory_visual_tokens", "memory_visual_views", "memory_dropout",
         }
         memory_kwargs = {key: data_cfg[key] for key in memory_keys if key in data_cfg} if data_cfg.get("memory_enabled", False) else {}
         init_kwargs = {k: v for k, v in kwargs.items() if k != "dataset_name"}

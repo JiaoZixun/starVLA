@@ -7,8 +7,9 @@ from starVLA.utils.robodojo_memory import RoboDojoMemoryBuffer, finite_array
 
 
 class RoboDojoMemorySessions:
-    def __init__(self, spec):
+    def __init__(self, spec, require_visual=False):
         self.spec = spec
+        self.require_visual = bool(require_visual)
         self.sessions = {}
 
     def reset(self):
@@ -35,16 +36,22 @@ class RoboDojoMemorySessions:
                 buffer = deepcopy(prior[1])
             raw_state = finite_array(example["raw_state"], (14,), "raw_state")
             for feedback in example["memory_feedback"]:
+                if self.require_visual and feedback.get("visual_tokens") is None and feedback.get("images", feedback.get("image")) is None:
+                    raise ValueError("RoboDojo visual memory feedback requires images or visual_tokens for every completed step")
                 buffer.append(feedback["state"], feedback["executed_action"],
-                              source_step=feedback["source_step"], pose=feedback.get("eef_pose"))
+                              source_step=feedback["source_step"], pose=feedback.get("eef_pose"),
+                              images=feedback.get("images", feedback.get("image")),
+                              visual_tokens=feedback.get("visual_tokens"))
             records = buffer.build(current)
+            burnin = buffer.build_burnin(current)
             contract = self.spec.contract(current, episode)
             self.spec.validate(records, contract)
             # Only observable inputs reach predict_action. State uses the same
             # training q99 transform, while history explicitly stays raw qpos.
             prepared.append({"image": example["image"], "lang": example["lang"],
                              "state": np.asarray(normalize_state(raw_state), dtype=np.float32),
-                             "memory_records": records, "memory_contract": contract})
+                             "memory_records": records, "memory_burnin_records": burnin,
+                             "memory_contract": contract})
             updates[key] = (episode, buffer)
         return prepared, updates
 
