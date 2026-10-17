@@ -71,12 +71,20 @@ class RoboDojoArxX5H50Q99DataConfig:
         action_modes = {key: "q99" for key in self.action_keys}
         return ComposedModalityTransform(
             transforms=[
-                StateActionToTensor(apply_to=self.state_keys),
+                # Parquet may store float64. Cast before q99, exactly as the
+                # serving raw-state/command protocol does, not after packing.
+                StateActionToTensor(
+                    apply_to=self.state_keys,
+                    output_dtypes={key: "torch.float32" for key in self.state_keys},
+                ),
                 StateActionTransform(
                     apply_to=self.state_keys,
                     normalization_modes=state_modes,
                 ),
-                StateActionToTensor(apply_to=self.action_keys),
+                StateActionToTensor(
+                    apply_to=self.action_keys,
+                    output_dtypes={key: "torch.float32" for key in self.action_keys},
+                ),
                 StateActionTransform(
                     apply_to=self.action_keys,
                     normalization_modes=action_modes,

@@ -3,16 +3,21 @@ import numpy as np
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
 from starVLA.utils.robodojo_memory import RoboDojoMemorySpec
+from starVLA.utils.robodojo_memory_sidecar import RoboDojoMemorySidecar
 
 
 class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
     def __init__(self, *args, memory_recent_records=16, memory_decision_stride=8,
-                 memory_state_dim=14, memory_action_dim=14, memory_use_pose=False, **kwargs):
+                 memory_state_dim=14, memory_action_dim=14, memory_use_pose=False,
+                 memory_sidecar_dir=None, **kwargs):
         super().__init__(*args, **kwargs)
         if memory_state_dim != 14 or memory_action_dim != 14:
             raise ValueError("RoboDojo requires two 6-DoF arms and two grippers (14 channels)")
         self.memory_spec = RoboDojoMemorySpec(memory_recent_records, memory_decision_stride, memory_use_pose)
         self._memory_active_sample = None
+        sidecar = memory_sidecar_dir or (self.data_cfg or {}).get("memory_sidecar_dir")
+        self._memory_sidecar = RoboDojoMemorySidecar(sidecar, self.dataset_path, self.memory_spec) if sidecar else None
+        self._memory_linked_episode = None
 
     def get_step_data(self, trajectory_id, base_index):
         # MixtureDataset calls get_step_data/_pack_sample directly.
@@ -21,7 +26,17 @@ class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
 
     def _memory_records(self, trajectory_id, frame_index):
         spec = self.memory_spec
-        indices = spec.indices(frame_index)
+        sidecar = getattr(self, "_memory_sidecar", None)
+        if sidecar is None:
+            indices = spec.indices(frame_index)
+        else:
+            if getattr(self, "_memory_linked_episode", None) != trajectory_id:
+                frames = self.curr_traj_data["frame_index"].to_numpy()
+                if not np.array_equal(frames, np.arange(len(frames))) or not (
+                        self.curr_traj_data["episode_index"] == trajectory_id).all():
+                    raise ValueError("Memory sidecar must link to the same original episode/frame rows")
+                self._memory_linked_episode = trajectory_id
+            indices = sidecar.indices(trajectory_id, len(self.curr_traj_data))[frame_index]
         valid = indices >= 0
         result = spec.empty()
         # One DataFrame gather, no historical video decoding, no action chunks,

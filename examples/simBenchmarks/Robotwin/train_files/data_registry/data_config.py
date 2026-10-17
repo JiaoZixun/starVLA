@@ -12,8 +12,9 @@ from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 class AgilexDataConfig:
     embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     video_keys = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
-    state_keys = ["state.left_joints", "state.right_joints", "state.left_gripper", "state.right_gripper"]
-    action_keys = ["action.left_joints", "action.right_joints", "action.left_gripper", "action.right_gripper"]
+    # Memory/inference contract: [left arm, left gripper, right arm, right gripper].
+    state_keys = ["state.left_joints", "state.left_gripper", "state.right_joints", "state.right_gripper"]
+    action_keys = ["action.left_joints", "action.left_gripper", "action.right_joints", "action.right_gripper"]
     # Per-key dims for PolicyNormProcessor (Agilex 6-DOF arms + binary gripper = 14-D total)
     action_key_dims = {"action.left_joints": 6, "action.right_joints": 6, "action.left_gripper": 1, "action.right_gripper": 1}
     state_key_dims  = {"state.left_joints": 6, "state.right_joints": 6, "state.left_gripper": 1, "state.right_gripper": 1}
@@ -48,6 +49,28 @@ class AgilexDataConfig:
                 },
             ),
         ])
+
+    def make_dataset(self, **kwargs):
+        data_cfg = kwargs.get("data_cfg") or {}
+        if data_cfg.get("memory_enabled", False):
+            from starVLA.dataloader.robodojo_memory import RoboDojoMemorySingleDataset
+            dataset_cls = RoboDojoMemorySingleDataset
+        else:
+            from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
+            dataset_cls = LeRobotSingleDataset
+        memory_keys = {"memory_recent_records", "memory_decision_stride", "memory_state_dim",
+                       "memory_action_dim", "memory_use_pose"}
+        memory_kwargs = {key: data_cfg[key] for key in memory_keys if key in data_cfg} if data_cfg.get("memory_enabled", False) else {}
+        sidecar_root = data_cfg.get("memory_sidecar_root") if data_cfg.get("memory_enabled", False) else None
+        if sidecar_root:
+            from pathlib import Path
+            dataset_name = str(kwargs.get("dataset_name", "")).strip("/")
+            if not dataset_name:
+                raise ValueError("Robotwin memory requires a dataset name for sidecar lookup")
+            memory_kwargs["memory_sidecar_dir"] = str(Path(sidecar_root) / dataset_name)
+        init_kwargs = {key: value for key, value in kwargs.items() if key != "dataset_name"}
+        init_kwargs.update(memory_kwargs)
+        return dataset_cls(**init_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +149,8 @@ ROBOT_TYPE_CONFIG_MAP = {
     "arx_x5": ArxX5DataConfig(),
 }
 
+ROBOT_TYPE_CONFIG_MAP["robotwin_clean_mem"] = ROBOT_TYPE_CONFIG_MAP["robotwin"]
+
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     # Per Proposal A, embodiment_tag now lives as a classvar on each DataConfig.
     # The registry derives ROBOT_TYPE_TO_EMBODIMENT_TAG automatically. Kept as
@@ -136,6 +161,23 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
 # Mixtures
 # ---------------------------------------------------------------------------
 DATASET_NAMED_MIXTURES = {
+    "robotwin_clean": [
+        (f"Clean/{task}", 1.0, "robotwin_clean_mem")
+        for task in (
+            "adjust_bottle", "beat_block_hammer", "blocks_ranking_rgb", "blocks_ranking_size",
+            "click_alarmclock", "click_bell", "dump_bin_bigbin", "grab_roller", "handover_block",
+            "handover_mic", "hanging_mug", "lift_pot", "move_can_pot", "move_pillbottle_pad",
+            "move_playingcard_away", "move_stapler_pad", "open_laptop", "open_microwave",
+            "pick_diverse_bottles", "pick_dual_bottles", "place_a2b_left", "place_a2b_right",
+            "place_bread_basket", "place_bread_skillet", "place_burger_fries", "place_can_basket",
+            "place_cans_plasticbox", "place_container_plate", "place_dual_shoes", "place_empty_cup",
+            "place_fan", "place_mouse_pad", "place_object_basket", "place_object_scale",
+            "place_object_stand", "place_phone_stand", "place_shoe", "press_stapler",
+            "put_bottles_dustbin", "put_object_cabinet", "rotate_qrcode", "scan_object",
+            "shake_bottle", "shake_bottle_horizontally", "stack_blocks_three", "stack_blocks_two",
+            "stack_bowls_three", "stack_bowls_two", "stamp_seal", "turn_switch",
+        )
+    ],
     "robotwin_all": [
         ("Clean/adjust_bottle", 1.0, "robotwin"), ("Randomized/adjust_bottle", 1.0, "robotwin"),
         ("Clean/beat_block_hammer", 1.0, "robotwin"), ("Randomized/beat_block_hammer", 1.0, "robotwin"),

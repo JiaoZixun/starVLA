@@ -69,12 +69,24 @@ def main() -> None:
             f"framework.qwenvl.base_vlm={DATA_ROOT / 'base_model/Qwen3.5-0.8B'}",
             f"datasets.vla_data.data_root_dir={DATA_ROOT / 'data/starvla_robodojo_v30'}",
             f"datasets.vla_data.spatial_sidecar_dir={DATA_ROOT / 'data/starvla_robodojo_v30/spatial_sidecar'}",
+            f"datasets.vla_data.memory_sidecar_dir={DATA_ROOT / 'memory_sidecars/robodojo_v30_r16_s8_v1'}",
             f"trainer.pretrained_checkpoint={DATA_ROOT / 'trained_checkpoint/robodojo_v30_qwen35_0p8b_oft/final_model/pytorch_model.pt'}",
         ]
     stage_a = paths + [item.lstrip('-') for item in shlex.split(os.environ.get("STAGE_A_OVERRIDES", ""))]
     cfg = resolve_config(stage_a, env)
     sidecar = cfg["datasets"]["vla_data"]["spatial_sidecar_dir"]
     stage_a_checkpoint = PROJECT_ROOT / cfg["run_root_dir"] / cfg["run_id"] / "final_model/pytorch_model.pt"
+    data = cfg["datasets"]["vla_data"]
+    memory = cfg["framework"]["memory"]
+    if data.get("memory_sidecar_dir"):
+        command = [str(PYTHON), str(SCRIPT_DIR / "prepare_memory_sidecar.py"),
+                   "--data-root", str(Path(data["data_root_dir"]) / "RoboDojo_lerobot_v30_video"),
+                   "--sidecar", data["memory_sidecar_dir"], "--validate",
+                   "--recent-records", str(memory["recent_records"]),
+                   "--decision-stride", str(memory["decision_stride_env_steps"])]
+        if memory.get("use_pose", False):
+            command.append("--use-pose")
+        run(command, env)
     run([str(PYTHON), str(SCRIPT_DIR / "prepare_spatial_sidecar.py"), "--sidecar", sidecar, "--validate"], env)
     common = [str(PYTHON), "-m", "accelerate.commands.launch", "--num_processes", "1", "starVLA/training/train_starvla.py", "--config_yaml", str(CONFIG)]
     run(common + flags(stage_a), env)

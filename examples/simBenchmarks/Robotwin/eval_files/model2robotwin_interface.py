@@ -1,4 +1,5 @@
 from collections import deque
+import uuid
 from typing import Dict, Optional
 
 import cv2 as cv
@@ -65,6 +66,11 @@ class ModelClient:
         self.action_chunk_size = None
         self.state_norm_stats = None
         self.raw_actions = None
+        self.env_id = "robotwin"
+        self.episode_id = None
+        self.pending_memory_feedback = []
+        self.last_observation_state = None
+        self.last_executed_action = None
 
         server_meta = self.client.get_server_metadata()
         self.action_chunk_size = server_meta["action_chunk_size"]
@@ -84,6 +90,10 @@ class ModelClient:
         # Reset state tracking for delta/rel modes
         self.initial_state = None
         self.prev_action = None
+        self.episode_id = uuid.uuid4().hex
+        self.pending_memory_feedback.clear()
+        self.last_observation_state = None
+        self.last_executed_action = None
 
     def step(
         self,
@@ -91,6 +101,7 @@ class ModelClient:
         step: int = 0,
     ) -> np.ndarray:
         state = example.get("state", None)
+        contract_state = None if state is None else np.asarray(state, dtype=np.float32)[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
         # if state is not None:
         #     state = self.normalize_state(state, self.state_norm_stats)
         #     state = state[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
@@ -114,8 +125,18 @@ class ModelClient:
 
         images = [self._resize_image(image) for image in images]
         example["image"] = images
-        example_copy = example.copy()
-        example_copy.pop("state")
+        if self.episode_id is None:
+            self.reset(task_description)
+        if step > 0 and self.last_observation_state is not None and self.last_executed_action is not None:
+            self.pending_memory_feedback.append({
+                "source_step": int(step - 1),
+                "state": self.last_observation_state.tolist(),
+                "executed_action": self.last_executed_action.tolist(),
+            })
+        example_copy = {"image": example["image"], "lang": task_description,
+                        "env_id": self.env_id, "episode_id": self.episode_id,
+                        "env_step": int(step), "raw_state": contract_state.tolist(),
+                        "memory_feedback": list(self.pending_memory_feedback)}
         vla_input = {
             "examples": [example_copy],
             "do_sample": False,
@@ -140,6 +161,7 @@ class ModelClient:
             response = self.client.predict_action(vla_input)
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
+            self.pending_memory_feedback.clear()
 
             # Convert delta/rel to absolute actions
             if self.action_mode == "delta":
@@ -159,8 +181,12 @@ class ModelClient:
         if self.action_mode == "delta":
             self.prev_action = current_action.copy()
 
-        current_action = current_action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
-        return current_action
+        # Dataset/model order [left arm, left gripper, right arm, right gripper]
+        # is converted back to RoboTwin's environment order [left arm, right arm, grippers].
+        env_action = current_action[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
+        self.last_observation_state = contract_state.copy()
+        self.last_executed_action = current_action.astype(np.float32, copy=True)
+        return env_action
 
     def _delta_to_absolute(self, delta_actions: np.ndarray, current_state: np.ndarray) -> np.ndarray:
         """Convert delta actions to absolute actions."""
@@ -220,7 +246,8 @@ def eval(TASK_ENV, model, observation):
     # Order: [head, left, right] to match training order
     images = [head_img, left_img, right_img]
 
-    state = observation["joint_action"]["vector"]
+    # RoboTwin observations use [left arm, right arm, grippers].
+    state = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
     example = {
         "lang": str(instruction),
         "image": images,
