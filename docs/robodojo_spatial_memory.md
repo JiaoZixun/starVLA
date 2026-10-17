@@ -13,7 +13,9 @@ learned slots、gated retrieval 和 waypoint conditioning，保留当前 RoboDoj
   在 q99 前统一为 float32，与在线输入精度一致，避免打包后才转换造成数值偏差。
 - 当前图像顺序为 `cam_high, cam_left_wrist, cam_right_wrist`，分辨率 224×224。
   历史每路图像预处理为有序 2×4 个 8×8 RGB patch（`uint8`），训练和在线端共用
-  `image_to_memory_tokens`，不重复解码模型视觉输入。
+  `image_to_memory_tokens`，不重复解码模型视觉输入。预处理以 parquet 每行 timestamp
+  加视频 `from_timestamp` 选择最近帧，与训练 loader 的 PyAV 路径一致；视频片段帧数
+  与 parquet 行数不一致时按相同时间戳规则补齐。
 - 默认在当前环境步 `t` 采样 `t - 8 × [16, 15, ..., 1]`，负索引以零填充。
   离线 parquet 与在线反馈使用同一 `RoboDojoMemorySpec`。
 - 一条记录为执行第 `s` 步之前的 raw state、第 `s` 步实际执行的 command，以及
@@ -81,6 +83,7 @@ PYTHONPATH=. python examples/simBenchmarks/RoboDojo/train_files/prepare_memory_s
 ```
 
 若目标目录已经存在，复核时在上述命令后添加 `--validate`，不会重新生成或写入数据。
+预处理中断时可用 `--resume-from /path/to/.building-directory` 复用已完成 episode。
 变更窗口/步距时使用新的输出版本，并同步设置 `--recent-records`、
 `--decision-stride` 和训练配置；开启 pose 时还需 `--use-pose`。
 

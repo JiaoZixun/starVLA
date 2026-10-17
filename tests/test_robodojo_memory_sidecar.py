@@ -1,6 +1,9 @@
 """Linked preprocessing must preserve causal online/offline semantics."""
 import json
 import os
+import sys
+import types
+from fractions import Fraction
 
 import numpy as np
 import pandas as pd
@@ -8,7 +11,8 @@ import pytest
 
 from starVLA.utils.robodojo_memory import RoboDojoMemoryBuffer, RoboDojoMemorySpec
 from starVLA.utils.robodojo_memory_sidecar import (
-    CAMERAS, RoboDojoMemorySidecar, build_sidecar, sha256, validate_sidecar,
+    CAMERAS, RoboDojoMemorySidecar, _decode_video_at_timestamps, build_sidecar,
+    history_indices, sha256, validate_sidecar,
 )
 
 
@@ -140,6 +144,47 @@ def test_source_adapter_can_link_original_data_and_metadata(source, tmp_path):
     manifest = validate_sidecar(output, adapter)
     assert manifest["total_frames"] == 201
     assert (output / "source_dataset").resolve() == adapter
+
+
+def test_resume_reuses_valid_indices_in_an_interrupted_build(source, tmp_path):
+    output = tmp_path / "memory/v1"
+    partial = output.with_name(".v1.building-interrupted")
+    (partial / "episodes").mkdir(parents=True)
+    np.save(partial / "episodes/000005.npy", history_indices(180, RoboDojoMemorySpec()), allow_pickle=False)
+    manifest = build_sidecar(source, output, workers=1, visual=False, resume_from=partial)
+    assert manifest["total_episodes"] == 2
+    assert output.is_dir() and not partial.exists()
+    np.testing.assert_array_equal(np.load(output / "episodes/000005.npy"), history_indices(180, RoboDojoMemorySpec()))
+
+
+def test_timestamp_decoder_reuses_last_nearest_frame_when_video_is_short(monkeypatch):
+    class Frame:
+        def __init__(self, pts):
+            self.pts = pts
+
+        def to_ndarray(self, format):
+            return np.full((16, 32, 3), self.pts * 50, dtype=np.uint8)
+
+    class Container:
+        streams = types.SimpleNamespace(video=[types.SimpleNamespace(time_base=Fraction(1, 10))])
+
+        def seek(self, *args, **kwargs):
+            pass
+
+        def decode(self, stream):
+            yield from (Frame(0), Frame(1), Frame(2))
+
+        def close(self):
+            pass
+
+    fake_av = types.ModuleType("av")
+    fake_av.open = lambda _: Container()
+    fake_av.error = types.SimpleNamespace(FFmpegError=RuntimeError)
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+
+    values = _decode_video_at_timestamps("unused.mp4", [0.0, 0.1, 0.2, 0.3], 4, "cam_high")
+    assert values.shape == (4, 8, 8, 8, 3)
+    np.testing.assert_array_equal(values[2], values[3])
 
 
 def test_training_dataset_uses_linked_raw_rows_and_matches_online(source, tmp_path):

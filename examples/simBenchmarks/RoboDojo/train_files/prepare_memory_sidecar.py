@@ -17,10 +17,12 @@ def main():
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--no-visual", action="store_true", help="Build legacy index-only sidecar")
     parser.add_argument("--validate", action="store_true", help="Validate an existing sidecar without writing anything")
+    parser.add_argument("--resume-from", type=Path, help="Resume an interrupted unpublished .building-* directory")
     args = parser.parse_args()
     spec = RoboDojoMemorySpec(args.recent_records, args.decision_stride, args.use_pose)
     if not args.validate:
-        build_sidecar(args.data_root, args.sidecar, spec, args.workers, visual=not args.no_visual)
+        build_sidecar(args.data_root, args.sidecar, spec, args.workers, visual=not args.no_visual,
+                      resume_from=args.resume_from)
     validate_sidecar(args.sidecar, args.data_root, spec)
 
 

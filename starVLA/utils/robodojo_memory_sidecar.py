@@ -92,16 +92,68 @@ def _video_path(source, camera, chunk, file_index):
     return source / "videos" / f"observation.images.{camera}" / f"chunk-{int(chunk):03d}" / f"file-{int(file_index):03d}.mp4"
 
 
-def _decode_episode_visual(source, metadata, episode, length):
-    """Decode the three AV1 streams and create the shared uint8 patch tensor."""
+def _decode_video_at_timestamps(path, timestamps, episode, camera):
+    """Select each nearest source frame using the training loader's timestamp contract."""
     try:
         import av
     except ImportError as exc:
         raise RuntimeError("PyAV is required to preprocess RoboDojo visual memory sidecars") from exc
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    if timestamps.ndim != 1 or timestamps.size == 0 or not np.isfinite(timestamps).all():
+        raise ValueError("Video timestamps must be a nonempty finite vector")
+    if np.any(np.diff(timestamps) < 0):
+        raise ValueError("Video timestamps must be ordered")
+    output = np.empty((len(timestamps), MEMORY_VISUAL_SHAPE[1], *MEMORY_VISUAL_SHAPE[2:]), dtype=np.uint8)
+    container = av.open(str(path))
+    try:
+        stream = container.streams.video[0]
+        time_base = float(stream.time_base)
+        # Start one second early so timestamp rounding at an episode boundary
+        # cannot skip the closest frame. Seek lands on an earlier keyframe.
+        target_pts = max(0, int((timestamps[0] - 1.0) / time_base))
+        try:
+            container.seek(target_pts, stream=stream, backward=True, any_frame=False)
+            seeked = True
+        except (av.error.FFmpegError, ValueError, TypeError):
+            seeked = False
+        iterator = iter(container.decode(stream))
+        previous = None
+
+        def next_frame():
+            for frame in iterator:
+                if frame.pts is None:
+                    continue
+                if seeked and frame.pts < target_pts:
+                    continue
+                return frame
+            return None
+
+        current = next_frame()
+        for index, timestamp in enumerate(timestamps):
+            while current is not None and float(current.pts) * time_base < timestamp:
+                previous, current = current, next_frame()
+            candidates = [frame for frame in (previous, current) if frame is not None]
+            if not candidates:
+                raise ValueError(f"No video frame for episode {episode}/{camera} at {timestamp:.6f}s")
+            closest = min(candidates, key=lambda frame: abs(float(frame.pts) * time_base - timestamp))
+            output[index] = image_to_memory_tokens(closest.to_ndarray(format="rgb24"))
+    finally:
+        container.close()
+    return output
+
+
+def _decode_episode_visual(source, metadata, episode, length, episode_timestamps):
+    """Decode three AV1 streams into patches aligned to parquet observation timestamps."""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError("PyAV is required to preprocess RoboDojo visual memory sidecars") from exc
+    episode_timestamps = np.asarray(episode_timestamps, dtype=np.float64)
+    if episode_timestamps.shape != (length,) or not np.isfinite(episode_timestamps).all():
+        raise ValueError(f"Episode {episode} must have {length} finite timestamps")
     output = np.empty((length, *MEMORY_VISUAL_SHAPE), dtype=np.uint8)
     hashes = {}
     for camera in CAMERAS:
-        prefix = f"videos/observation.images.{camera}/"
         path = _video_path(source, camera, metadata[f"videos/observation.images.{camera}/chunk_index"],
                            metadata[f"videos/observation.images.{camera}/file_index"])
         if not path.is_file():
@@ -149,15 +201,23 @@ def _decode_episode_visual(source, metadata, episode, length):
         finally:
             container.close()
         if decoded != length:
-            raise ValueError(f"Video frame count for episode {episode}/{camera}: {decoded} != {length}")
+            # LeRobot maps every parquet timestamp to the nearest video frame;
+            # episode video segments can differ from parquet row counts by one.
+            # Reuse that exact rule instead of rejecting or shifting the history.
+            print(f"Timestamp-aligning episode {episode}/{camera}: sequential frames {decoded}/{length}", flush=True)
+            targets = episode_timestamps + start_ts
+            output[:, CAMERAS.index(camera)] = _decode_video_at_timestamps(path, targets, episode, camera)
     return output, hashes
 
 
-def _build_file(source, path, target, spec, episode_meta=None, visual=False):
+def _build_file(source, path, target, spec, episode_meta=None, visual=False, resume=False):
     import pandas as pd
 
     before = path.stat()
-    data = pd.read_parquet(path, columns=["episode_index", "frame_index", "observation.state", "action"])
+    columns = ["episode_index", "frame_index", "observation.state", "action"]
+    if visual:
+        columns.append("timestamp")
+    data = pd.read_parquet(path, columns=columns)
     relative = str(path.relative_to(source))
     episodes = {}
     for episode, group in data.groupby("episode_index", sort=False):
@@ -177,17 +237,50 @@ def _build_file(source, path, target, spec, episode_meta=None, visual=False):
                 raise ValueError(f"Episode {episode}: {key} must be finite raw [N,14]")
         name = f"episodes/{episode:06d}.npy"
         destination = target / name
-        # Fail on duplicates, including episodes split between source shards.
-        with destination.open("xb") as stream:
-            np.save(stream, history_indices(length, spec), allow_pickle=False)
+        expected_indices = history_indices(length, spec)
+        if destination.exists():
+            if not resume:
+                raise FileExistsError(f"Duplicate episode sidecar: {destination}")
+            existing_indices = np.load(destination, mmap_mode="r", allow_pickle=False)
+            if existing_indices.dtype != np.int32 or not np.array_equal(existing_indices, expected_indices):
+                raise ValueError(f"Invalid resumable memory indices: {destination}")
+        else:
+            temporary_index = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+            with temporary_index.open("xb") as stream:
+                np.save(stream, expected_indices, allow_pickle=False)
+            temporary_index.replace(destination)
         visual_meta = None
         if visual:
             if episode_meta is None or episode not in episode_meta:
                 raise ValueError(f"Missing episode metadata for visual episode {episode}")
-            visual_values, video_hashes = _decode_episode_visual(source, episode_meta[episode], episode, length)
             visual_destination = target / f"episodes/{episode:06d}.visual.npy"
-            with visual_destination.open("xb") as stream:
-                np.save(stream, visual_values, allow_pickle=False)
+            visual_values = None
+            if visual_destination.exists() and resume:
+                try:
+                    existing_visual = np.load(visual_destination, mmap_mode="r", allow_pickle=False)
+                    if existing_visual.dtype == np.uint8 and existing_visual.shape == (length, *MEMORY_VISUAL_SHAPE):
+                        visual_values = existing_visual
+                    else:
+                        visual_destination.unlink()
+                except (OSError, ValueError):
+                    visual_destination.unlink(missing_ok=True)
+            elif visual_destination.exists():
+                raise FileExistsError(f"Duplicate episode visual sidecar: {visual_destination}")
+            video_hashes = {}
+            if visual_values is None:
+                visual_values, video_hashes = _decode_episode_visual(
+                    source, episode_meta[episode], episode, length, group["timestamp"].to_numpy()
+                )
+                temporary_visual = visual_destination.with_name(f".{visual_destination.name}.{uuid.uuid4().hex}.tmp")
+                with temporary_visual.open("xb") as stream:
+                    np.save(stream, visual_values, allow_pickle=False)
+                temporary_visual.replace(visual_destination)
+            else:
+                for camera in CAMERAS:
+                    path = _video_path(source, camera,
+                        episode_meta[episode][f"videos/observation.images.{camera}/chunk_index"],
+                        episode_meta[episode][f"videos/observation.images.{camera}/file_index"])
+                    video_hashes[camera] = _cached_sha256(str(path))
             visual_meta = {"file": str(visual_destination.relative_to(target)), "sha256": sha256(visual_destination),
                            "visual_shape": list(visual_values.shape[1:]), "visual_dtype": "uint8",
                            "video_sha256": video_hashes}
@@ -204,7 +297,7 @@ def _build_file(source, path, target, spec, episode_meta=None, visual=False):
     return relative, {"sha256": digest, "size_bytes": after.st_size, "rows": len(data)}, episodes
 
 
-def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=True):
+def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=True, resume_from=None):
     """Publish a complete version atomically; never edit/duplicate source data."""
     source, output = Path(source).resolve(), Path(output).absolute()
     if output.resolve().is_relative_to(source):
@@ -218,10 +311,20 @@ def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=T
     if not files:
         raise ValueError("No source parquet shards found")
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.building-{uuid.uuid4().hex}")
-    temporary.mkdir()
+    resuming = resume_from is not None
+    if resuming:
+        temporary = Path(resume_from).resolve()
+        if not temporary.is_dir() or not (temporary / "episodes").is_dir():
+            raise ValueError(f"Resume directory must contain episodes/: {temporary}")
+        if (temporary / "manifest.json").exists() or (temporary / "source_dataset").exists():
+            raise ValueError("Resume directory already contains published metadata")
+        for stale in (temporary / "episodes").glob(".*.tmp"):
+            stale.unlink()
+    else:
+        temporary = output.with_name(f".{output.name}.building-{uuid.uuid4().hex}")
+        temporary.mkdir()
     try:
-        (temporary / "episodes").mkdir()
+        (temporary / "episodes").mkdir(exist_ok=True)
         metadata_names = ["meta/info.json", "meta/modality.json"]
         metadata_names += [name for name in ("meta/stats.json", "meta/stats_gr00t.json", "meta/tasks.parquet")
                            if (source / name).is_file()]
@@ -248,7 +351,7 @@ def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=T
             manifest.update({"visual_shape": list(MEMORY_VISUAL_SHAPE), "visual_dtype": "uint8",
                              "visual_encoding": "ordered_rgb_2x4_box_8x8", "visual_sidecar": True})
         with ThreadPoolExecutor(max_workers=min(workers, len(files))) as pool:
-            results = pool.map(lambda path: _build_file(source, path, temporary, spec, episode_meta, visual), files)
+            results = pool.map(lambda path: _build_file(source, path, temporary, spec, episode_meta, visual, resuming), files)
             for relative, meta, episodes in results:
                 if manifest["episodes"].keys() & episodes.keys():
                     raise ValueError("Episode spans multiple source shards")
@@ -266,7 +369,10 @@ def build_sidecar(source, output, spec=RoboDojoMemorySpec(), workers=3, visual=T
         (temporary / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         temporary.rename(output)
     except BaseException:
-        shutil.rmtree(temporary)
+        if resuming:
+            print(f"Resume failed; preserving partial sidecar at {temporary}", flush=True)
+        else:
+            shutil.rmtree(temporary)
         raise
     return manifest
 
