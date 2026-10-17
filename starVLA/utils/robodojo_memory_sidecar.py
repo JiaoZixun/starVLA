@@ -277,10 +277,10 @@ def _build_file(source, path, target, spec, episode_meta=None, visual=False, res
                 temporary_visual.replace(visual_destination)
             else:
                 for camera in CAMERAS:
-                    path = _video_path(source, camera,
+                    video_path = _video_path(source, camera,
                         episode_meta[episode][f"videos/observation.images.{camera}/chunk_index"],
                         episode_meta[episode][f"videos/observation.images.{camera}/file_index"])
-                    video_hashes[camera] = _cached_sha256(str(path))
+                    video_hashes[camera] = _cached_sha256(str(video_path))
             visual_meta = {"file": str(visual_destination.relative_to(target)), "sha256": sha256(visual_destination),
                            "visual_shape": list(visual_values.shape[1:]), "visual_dtype": "uint8",
                            "video_sha256": video_hashes}

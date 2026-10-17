@@ -11,7 +11,7 @@ import pytest
 
 from starVLA.utils.robodojo_memory import RoboDojoMemoryBuffer, RoboDojoMemorySpec
 from starVLA.utils.robodojo_memory_sidecar import (
-    CAMERAS, RoboDojoMemorySidecar, _decode_video_at_timestamps, build_sidecar,
+    CAMERAS, MEMORY_VISUAL_SHAPE, RoboDojoMemorySidecar, _decode_video_at_timestamps, build_sidecar,
     history_indices, sha256, validate_sidecar,
 )
 
@@ -155,6 +155,43 @@ def test_resume_reuses_valid_indices_in_an_interrupted_build(source, tmp_path):
     assert manifest["total_episodes"] == 2
     assert output.is_dir() and not partial.exists()
     np.testing.assert_array_equal(np.load(output / "episodes/000005.npy"), history_indices(180, RoboDojoMemorySpec()))
+
+
+def test_visual_build_hashes_source_parquet_after_video_hashes(source, tmp_path, monkeypatch):
+    import starVLA.utils.robodojo_memory_sidecar as sidecar
+
+    data_path = source / "data/chunk-000/file-000.parquet"
+    data = pd.read_parquet(data_path)
+    data["timestamp"] = data["frame_index"] / 25
+    data.to_parquet(data_path, index=False)
+
+    episode_meta = []
+    for episode, length in ((5, 180), (8, 21)):
+        row = {"episode_index": episode, "length": length}
+        for camera in CAMERAS:
+            row[f"videos/observation.images.{camera}/chunk_index"] = 0
+            row[f"videos/observation.images.{camera}/file_index"] = 0
+            row[f"videos/observation.images.{camera}/from_timestamp"] = 0.0
+            video = source / "videos" / f"observation.images.{camera}" / "chunk-000/file-000.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.touch(exist_ok=True)
+        episode_meta.append(row)
+    meta_path = source / "meta/episodes/chunk-000/file-000.parquet"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(episode_meta).to_parquet(meta_path, index=False)
+
+    monkeypatch.setattr(sidecar, "_decode_episode_visual", lambda _source, _meta, _episode, length, _timestamps: (
+        np.zeros((length, *MEMORY_VISUAL_SHAPE), np.uint8), {camera: "video-hash" for camera in CAMERAS}
+    ))
+    output = tmp_path / "visual/v1"
+    partial = output.with_name(".v1.building-resume")
+    (partial / "episodes").mkdir(parents=True)
+    np.save(partial / "episodes/000005.npy", history_indices(180, RoboDojoMemorySpec()), allow_pickle=False)
+    np.save(partial / "episodes/000005.visual.npy", np.zeros((180, *MEMORY_VISUAL_SHAPE), np.uint8), allow_pickle=False)
+    manifest = build_sidecar(source, output, workers=1, resume_from=partial)
+    assert manifest["source_files"]["data/chunk-000/file-000.parquet"]["sha256"] == sha256(data_path)
+    assert manifest["total_frames"] == 201
+    assert all("visual" in entry for entry in manifest["episodes"].values())
 
 
 def test_timestamp_decoder_reuses_last_nearest_frame_when_video_is_short(monkeypatch):
