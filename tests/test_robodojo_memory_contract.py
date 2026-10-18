@@ -53,6 +53,31 @@ def test_future_rows_never_enter_dataset_history():
         np.testing.assert_array_equal(before[key], after[key])
 
 
+def test_dataset_burnin_keeps_elapsed_steps_float32():
+    spec = RoboDojoMemorySpec(3, 4)
+    dataset = object.__new__(RoboDojoMemorySingleDataset)
+    dataset.memory_spec = spec
+    dataset.curr_traj_data = episode_data()
+    dataset._memory_visual_episode = 0
+    dataset._memory_visual = np.zeros(
+        (len(dataset.curr_traj_data), 3, 8, 8, 8, 3), dtype=np.uint8
+    )
+
+    burnin = dataset._memory_burnin_records(0, 20)
+    assert burnin["elapsed_env_steps"].dtype == np.float32
+
+    record = spec.empty()
+    indices = spec.indices(20)
+    record["valid_mask"] = indices >= 0
+    record["source_frame_index"] = indices
+    record["elapsed_env_steps"] = 20 - indices
+    example = {"memory_records": record,
+               "memory_burnin_records": burnin,
+               "memory_contract": spec.contract(20)}
+    batched = tiny_model(spec)._batch_memory_records([example])[1]
+    assert batched["elapsed_env_steps"].dtype == np.float32
+
+
 def tiny_model(spec):
     model = QwenSpatialMemOFT.__new__(QwenSpatialMemOFT)
     torch.nn.Module.__init__(model)
