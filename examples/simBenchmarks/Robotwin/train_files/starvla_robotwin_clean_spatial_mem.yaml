@@ -51,7 +51,7 @@ datasets:
     action_type: abs_qpos
     action_mode: abs
     memory_enabled: true
-    memory_sidecar_root: playground/Datasets/RoboTwin/memory_sidecars/robotwin_clean_r16_s8_v1
+    memory_sidecar_root: playground/Datasets/RoboTwin/memory_sidecars/robotwin_clean_r16_s8_v2
     memory_recent_records: 16
     memory_decision_stride: 8
     memory_state_dim: 14

@@ -12,7 +12,7 @@ PYTHON = Path(os.environ.get("PYTHON_BIN", "/public/home/jiaozixun/anaconda3/env
 CONFIG = Path(os.environ.get("CONFIG_YAML", HERE / "starvla_robotwin_clean_spatial_mem.yaml")).resolve()
 DATA_ROOT = Path(os.environ.get("ROBOTWIN_DATA_ROOT", ROOT / "playground/Datasets/RoboTwin/lerobot_clean")).resolve()
 MEMORY_SIDECAR_ROOT = Path(os.environ.get(
-    "ROBOTWIN_MEMORY_SIDECAR_ROOT", ROOT / "playground/Datasets/RoboTwin/memory_sidecars/robotwin_clean_r16_s8_v1"
+    "ROBOTWIN_MEMORY_SIDECAR_ROOT", ROOT / "playground/Datasets/RoboTwin/memory_sidecars/robotwin_clean_r16_s8_v2"
 )).resolve()
 BASE_VLM = Path(os.environ.get(
     "STARVLA_BASE_VLM",

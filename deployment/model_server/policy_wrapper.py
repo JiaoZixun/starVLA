@@ -1,23 +1,6 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License.
-"""Policy server wrapper.
-
-Encapsulates a `baseframework` instance plus a :class:`PolicyNormProcessor`
-that reuses the *training-time* :class:`ComposedModalityTransform` for action
-un-normalization (no hand-rolled math). The websocket server returns
-already-unnormalized actions.
-
-Client-side responsibilities that REMAIN on the client:
-  - environment-specific adapters (image_history, gripper sticky, action
-    ensembling)
-  - chunk-cache scheduling (`step % chunk_size == 0` triggers a new infer)
-
-Exposed API:
-  - ``metadata`` (dict, sent at handshake): ``action_chunk_size``,
-    ``available_unnorm_keys``, ``action_keys``, ``state_keys``.
-  - ``predict_action(examples, unnorm_key=None, **kwargs)`` returns
-    ``{"actions": np.ndarray[B, T, action_dim]}``.
-"""
+"""Policy server wrapper using the training-time modality transforms."""
 
 from __future__ import annotations
 
@@ -29,50 +12,35 @@ import torch
 
 from starVLA.model.framework.base_framework import baseframework, merge_config_overrides
 from starVLA.model.framework.share_tools import read_mode_config
-
 from deployment.model_server.policy_norm_processor import PolicyNormProcessor
 from deployment.model_server.robodojo_memory_adapter import RoboDojoMemorySessions
 from starVLA.utils.robodojo_memory import RoboDojoMemorySpec
 
 
 def _training_obs_image_size(model_cfg: Dict[str, Any]) -> Optional[List[int]]:
-    """Return training image size metadata when it is explicitly configured.
-
-    This is only a consistency check for eval clients. It is not used to infer
-    camera order or to rewrite eval observations.
-    """
     vla_data_cfg = model_cfg.get("datasets", {}).get("vla_data", {})
     size = vla_data_cfg.get("obs_image_size") or vla_data_cfg.get("image_size")
     if size is None and "default_image_resolution" in vla_data_cfg:
-        default_resolution = vla_data_cfg["default_image_resolution"]
-        if isinstance(default_resolution, (list, tuple)) and len(default_resolution) >= 2:
-            size = default_resolution[-2:]
+        resolution = vla_data_cfg["default_image_resolution"]
+        if isinstance(resolution, (list, tuple)) and len(resolution) >= 2:
+            size = resolution[-2:]
     if not isinstance(size, (list, tuple)) or len(size) != 2:
         return None
     return [int(size[0]), int(size[1])]
 
 
 class PolicyServerWrapper:
-    """Wraps a `baseframework` for use as a websocket-server policy."""
+    """Wrap a trained framework for websocket inference."""
 
-    def __init__(
-        self,
-        ckpt_path: str,
-        device: str = "cuda",
-        use_bf16: bool = False,
-        unnorm_key: Optional[str] = None,
-        config_overrides: Sequence[str] | None = None,
-    ) -> None:
+    def __init__(self, ckpt_path: str, device: str = "cuda", use_bf16: bool = False,
+                 unnorm_key: Optional[str] = None, config_overrides: Sequence[str] | None = None) -> None:
         self._ckpt_path = str(ckpt_path)
-
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
         framework = baseframework.from_pretrained(self._ckpt_path, config_overrides=config_overrides)
         if use_bf16:
             framework = framework.to(torch.bfloat16)
-        framework = framework.to(device).eval()
-        self._framework = framework
+        self._framework = framework.to(device).eval()
 
-        # Co-located metadata.
         model_cfg, norm_stats = read_mode_config(self._ckpt_path)
         model_cfg = merge_config_overrides(model_cfg, config_overrides)
         self._model_cfg = model_cfg
@@ -80,73 +48,40 @@ class PolicyServerWrapper:
         self._memory_sessions = None
         if model_cfg.get("framework", {}).get("name") == "QwenSpatialMemOFT":
             self._memory_sessions = RoboDojoMemorySessions(RoboDojoMemorySpec(
-                int(memory.get("recent_records", 16)), int(memory.get("decision_stride_env_steps", 8)),
-                bool(memory.get("use_pose", False))))
+                int(memory.get("recent_records", 16)),
+                int(memory.get("decision_stride_env_steps", 8)),
+                bool(memory.get("use_pose", False)),
+            ))
 
-        # action_chunk_size = future_action_window_size + 1 (matches old client).
-        action_model_cfg = model_cfg["framework"]["action_model"]
-
-        if "action_horizon" in action_model_cfg:
-            self._action_chunk_size = int(action_model_cfg["action_horizon"])
-        elif "future_action_window_size" in action_model_cfg:
-            self._action_chunk_size = int(action_model_cfg["future_action_window_size"]) + 1
+        action_cfg = model_cfg["framework"]["action_model"]
+        if "action_horizon" in action_cfg:
+            self._action_chunk_size = int(action_cfg["action_horizon"])
+        elif "future_action_window_size" in action_cfg:
+            self._action_chunk_size = int(action_cfg["future_action_window_size"]) + 1
         else:
-            raise ValueError(
-                f"PolicyServerWrapper: no action_horizon or future_action_window_size found in model config for {self._ckpt_path}"
-            )
-        # Cache of PolicyNormProcessor instances per unnorm_key.
-        # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
-        # ckpts clients must pass unnorm_key per request.
+            raise ValueError(f"No action horizon found in model config for {self._ckpt_path}")
+
         self._default_unnorm_key = unnorm_key
         self._norm_processors: Dict[str, PolicyNormProcessor] = {}
-
-        # Peek at available keys without building a full processor.
-        self._available_unnorm_keys: List[str] = list(norm_stats.keys())
-
-        # Eagerly build when unambiguous; defer for multi-key / no explicit key.
+        self._available_unnorm_keys = list(norm_stats.keys())
         if unnorm_key is not None or len(self._available_unnorm_keys) == 1:
-            default_proc = self._get_processor(unnorm_key)
-            self._default_unnorm_key = default_proc.unnorm_key
-            logging.info(
-                "PolicyServerWrapper ready: action_chunk_size=%d, default_unnorm_key=%s, "
-                "available_unnorm_keys=%s, action_keys=%s, state_keys=%s",
-                self._action_chunk_size,
-                default_proc.unnorm_key,
-                default_proc.available_unnorm_keys,
-                default_proc.action_keys,
-                default_proc.state_keys,
-            )
-        else:
-            logging.info(
-                "PolicyServerWrapper ready (multi-key): action_chunk_size=%d, "
-                "available_unnorm_keys=%s — clients must pass unnorm_key per request.",
-                self._action_chunk_size,
-                self._available_unnorm_keys,
-            )
+            processor = self._get_processor(unnorm_key)
+            self._default_unnorm_key = processor.unnorm_key
+            logging.info("PolicyServerWrapper ready: action_chunk_size=%d, unnorm_key=%s",
+                         self._action_chunk_size, processor.unnorm_key)
 
     def _get_processor(self, unnorm_key: Optional[str]) -> PolicyNormProcessor:
-        cache_key = unnorm_key if unnorm_key is not None else "__default__"
-        if cache_key not in self._norm_processors:
-            self._norm_processors[cache_key] = PolicyNormProcessor(
-                self._ckpt_path, unnorm_key=unnorm_key
-            )
-        return self._norm_processors[cache_key]
+        key = unnorm_key if unnorm_key is not None else "__default__"
+        if key not in self._norm_processors:
+            self._norm_processors[key] = PolicyNormProcessor(self._ckpt_path, unnorm_key=unnorm_key)
+        return self._norm_processors[key]
 
     def get_norm_processor(self, unnorm_key: Optional[str] = None) -> PolicyNormProcessor:
-        """Public accessor for the per-unnorm_key normalization processor.
-
-        Protocol adapters (e.g. the GR00T ZMQ compat server) use this to read
-        the training-time ``action_keys`` / ``state_keys`` and their per-key
-        dims so they can split the flat action chunk into named groups.
-        """
-        return self._get_processor(
-            unnorm_key if unnorm_key is not None else self._default_unnorm_key
-        )
+        return self._get_processor(unnorm_key if unnorm_key is not None else self._default_unnorm_key)
 
     @property
     def metadata(self) -> Dict[str, Any]:
-        """Model-invariant metadata; sent to client at websocket handshake."""
-        base = {
+        result = {
             "env": "starvla_policy_server",
             "ckpt_path": self._ckpt_path,
             "action_chunk_size": self._action_chunk_size,
@@ -155,69 +90,50 @@ class PolicyServerWrapper:
             "training_data_mix": self._model_cfg.get("datasets", {}).get("vla_data", {}).get("data_mix"),
             "training_obs_image_size": _training_obs_image_size(self._model_cfg),
             "eval_image_contract": (
-                "Eval clients must explicitly choose image count and order. "
-                "The server does not infer or reorder camera views from training config."
+                "Eval clients must explicitly provide the training camera count and order; "
+                "the server does not infer or reorder camera views."
             ),
         }
-        # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
-            proc = self._get_processor(self._default_unnorm_key)
-            base["action_keys"] = proc.action_keys
-            base["state_keys"] = proc.state_keys
+            processor = self._get_processor(self._default_unnorm_key)
+            result["action_keys"] = processor.action_keys
+            result["state_keys"] = processor.state_keys
         if self._memory_sessions is not None:
             spec = self._memory_sessions.spec
-            base["execution_memory"] = {
-                "recent_records": spec.recent_records, "stride": spec.decision_stride, "use_pose": spec.use_pose,
+            result["execution_memory"] = {
+                "recent_records": spec.recent_records,
+                "stride": spec.decision_stride,
+                "use_pose": spec.use_pose,
                 "required_fields": ["env_id", "episode_id", "env_step", "raw_state", "memory_feedback"],
                 "feedback": "Every completed environment step: source_step, raw state[14], actual executed_action[14]",
                 "representation": "raw_dual_arm_abs_qpos_v1",
             }
-        return base
+        return result
 
-    def predict_action(
-        self,
-        examples: List[dict],
-        unnorm_key: Optional[str] = None,
-        **kwargs,
-    ) -> Dict[str, np.ndarray]:
-        """Run the framework, then un-normalize via training-time transforms.
-
-        Args:
-            examples: list of dicts (each with ``image`` / ``lang`` / optional ``state``).
-            unnorm_key: dataset key for un-normalization stats. ``None`` -->
-                use the wrapper's default (auto-picked at startup).
-            **kwargs: forwarded to the framework's ``predict_action``
-                (``do_sample``, ``use_ddim``, ``num_ddim_steps``, ...).
-
-        Returns:
-            ``{"actions": np.ndarray[B, T, D]}`` -- un-normalized.
-        """
+    def predict_action(self, examples: List[dict], unnorm_key: Optional[str] = None, **kwargs) -> Dict[str, np.ndarray]:
         effective_key = unnorm_key if unnorm_key is not None else self._default_unnorm_key
         if effective_key is None:
-            if len(self._available_unnorm_keys) == 1:
-                effective_key = self._available_unnorm_keys[0]
-            else:
-                raise ValueError(
-                    f"predict_action: unnorm_key not specified and no default set. "
-                    f"Pass one of {self._available_unnorm_keys}."
-                )
-        proc = self._get_processor(effective_key)
+            if len(self._available_unnorm_keys) != 1:
+                raise ValueError(f"Specify unnorm_key from {self._available_unnorm_keys}")
+            effective_key = self._available_unnorm_keys[0]
+        processor = self._get_processor(effective_key)
 
         updates = None
         if self._memory_sessions is not None:
-            examples, updates = self._memory_sessions.prepare(examples, proc.apply_state, namespace=effective_key)
-        out = self._framework.predict_action(examples=examples, **kwargs)
-        normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
-
-        unnorm = np.stack(
-            [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
-            axis=0,
-        )
+            expected_size = _training_obs_image_size(self._model_cfg)
+            configured_size = kwargs.pop("eval_image_size", None)
+            if configured_size is not None and expected_size is not None and list(configured_size) != expected_size:
+                raise ValueError(f"Eval image size {configured_size} differs from training size {expected_size}")
+            examples, updates = self._memory_sessions.prepare(examples, processor.apply_state, namespace=effective_key)
+        output = self._framework.predict_action(examples=examples, **kwargs)
+        normalized = np.asarray(output["normalized_actions"])
+        if normalized.ndim != 3 or normalized.shape[0] != len(examples):
+            raise ValueError(f"Expected normalized actions [B,T,D], got {normalized.shape}")
+        actions = np.stack([processor.unapply_actions(normalized[b]) for b in range(normalized.shape[0])], axis=0)
         if updates is not None:
             self._memory_sessions.commit(updates)
-        return {"actions": unnorm}
+        return {"actions": actions}
 
     def reset_memory(self) -> None:
-        """Clear all episode streams (individual streams use a new episode_id)."""
         if self._memory_sessions is not None:
             self._memory_sessions.reset()

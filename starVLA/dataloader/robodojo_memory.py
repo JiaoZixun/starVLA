@@ -8,16 +8,18 @@ from starVLA.utils.robodojo_memory_sidecar import RoboDojoMemorySidecar
 
 class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
     def __init__(self, *args, memory_recent_records=16, memory_decision_stride=8,
-                 memory_state_dim=14, memory_action_dim=14, memory_use_pose=False,
+                 memory_state_dim=14, memory_action_dim=14, memory_use_pose=False, memory_bptt_records=8,
                  memory_sidecar_dir=None, **kwargs):
         super().__init__(*args, **kwargs)
         if memory_state_dim != 14 or memory_action_dim != 14:
             raise ValueError("RoboDojo requires two 6-DoF arms and two grippers (14 channels)")
-        self.memory_spec = RoboDojoMemorySpec(memory_recent_records, memory_decision_stride, memory_use_pose)
+        self.memory_spec = RoboDojoMemorySpec(memory_recent_records, memory_decision_stride, memory_use_pose, memory_bptt_records)
         self._memory_active_sample = None
         sidecar = memory_sidecar_dir or (self.data_cfg or {}).get("memory_sidecar_dir")
         self._memory_sidecar = RoboDojoMemorySidecar(sidecar, self.dataset_path, self.memory_spec) if sidecar else None
         self._memory_linked_episode = None
+        self._memory_visual_episode = None
+        self._memory_visual = None
 
     def get_step_data(self, trajectory_id, base_index):
         # MixtureDataset calls get_step_data/_pack_sample directly.
@@ -37,6 +39,9 @@ class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
                     raise ValueError("Memory sidecar must link to the same original episode/frame rows")
                 self._memory_linked_episode = trajectory_id
             indices = sidecar.indices(trajectory_id, len(self.curr_traj_data))[frame_index]
+            if self._memory_visual_episode != trajectory_id:
+                self._memory_visual = sidecar.visual_tokens(trajectory_id, len(self.curr_traj_data))
+                self._memory_visual_episode = trajectory_id
         valid = indices >= 0
         result = spec.empty()
         # One DataFrame gather, no historical video decoding, no action chunks,
@@ -47,6 +52,9 @@ class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
                 raise ValueError("RoboDojo memory requires contiguous episode frame indices")
             result["state"][valid] = np.stack(rows["observation.state"].to_numpy())
             result["executed_actions"][valid] = np.stack(rows["action"].to_numpy())
+            if sidecar is None:
+                raise ValueError("Robotwin visual memory requires a prepared linked visual sidecar")
+            result["visual_tokens"][valid] = self._memory_visual[indices[valid]]
             if spec.use_pose:
                 # The parent's current-sample geometry has already loaded and
                 # validated this episode's proprioceptive FK sidecar.
@@ -68,5 +76,30 @@ class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
             raise RuntimeError("get_step_data must precede memory sample packing")
         episode, step = self._memory_active_sample
         sample["memory_records"] = self._memory_records(episode, step)
+        sample["memory_burnin_records"] = self._memory_burnin_records(episode, step)
         sample["memory_contract"] = self.memory_spec.contract(step, episode)
         return sample
+
+    def _memory_burnin_records(self, trajectory_id, frame_index):
+        spec = self.memory_spec
+        indices = spec.burnin_indices(frame_index)
+        result = spec.empty_burnin(len(indices))
+        if not len(indices):
+            return result
+        if self._memory_visual_episode != trajectory_id:
+            self._memory_visual = self._memory_sidecar.visual_tokens(trajectory_id, len(self.curr_traj_data))
+            self._memory_visual_episode = trajectory_id
+        rows = self.curr_traj_data.iloc[indices]
+        if not np.array_equal(np.asarray(rows["frame_index"], dtype=np.int64), indices):
+            raise ValueError("Burn-in records do not map to contiguous source frames")
+        result["visual_tokens"] = np.asarray(self._memory_visual[indices])
+        result["state"] = np.stack(rows["observation.state"].to_numpy()).astype(np.float32)
+        result["executed_actions"] = np.stack(rows["action"].to_numpy()).astype(np.float32)
+        result["source_frame_index"] = indices
+        result["elapsed_env_steps"] = frame_index - indices
+        if spec.use_pose:
+            cached = self._spatial_episode_cache.get(int(trajectory_id))
+            result["eef_pose"] = cached["pose"][indices]
+        if np.any(indices >= frame_index):
+            raise ValueError("Burn-in must contain only records strictly before current frame")
+        return result

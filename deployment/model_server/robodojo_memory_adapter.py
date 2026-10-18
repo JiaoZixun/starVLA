@@ -36,15 +36,19 @@ class RoboDojoMemorySessions:
             raw_state = finite_array(example["raw_state"], (14,), "raw_state")
             for feedback in example["memory_feedback"]:
                 buffer.append(feedback["state"], feedback["executed_action"],
-                              source_step=feedback["source_step"], pose=feedback.get("eef_pose"))
+                              source_step=feedback["source_step"],
+                              visual_tokens=feedback["visual_tokens"],
+                              pose=feedback.get("eef_pose"))
             records = buffer.build(current)
+            burnin_records = buffer.build_burnin(current)
             contract = self.spec.contract(current, episode)
             self.spec.validate(records, contract)
             # Only observable inputs reach predict_action. State uses the same
             # training q99 transform, while history explicitly stays raw qpos.
             prepared.append({"image": example["image"], "lang": example["lang"],
                              "state": np.asarray(normalize_state(raw_state), dtype=np.float32),
-                             "memory_records": records, "memory_contract": contract})
+                             "memory_records": records, "memory_burnin_records": burnin_records,
+                             "memory_contract": contract})
             updates[key] = (episode, buffer)
         return prepared, updates
 

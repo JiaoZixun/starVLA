@@ -6,6 +6,7 @@ import cv2 as cv
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
+from starVLA.dataloader.memory_visual import image_to_memory_tokens
 
 try:
     from examples.simBenchmarks.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
@@ -14,6 +15,13 @@ except ImportError:
 
 
 class ModelClient:
+    _STATE_TO_CONTRACT = np.asarray(
+        [0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13], dtype=np.int64
+    )
+    _ACTION_TO_ENV = np.asarray(
+        [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13], dtype=np.int64
+    )
+
     def __init__(
         self,
         policy_ckpt_path,
@@ -70,6 +78,7 @@ class ModelClient:
         self.episode_id = None
         self.pending_memory_feedback = []
         self.last_observation_state = None
+        self.last_observation_visual_tokens = None
         self.last_executed_action = None
 
         server_meta = self.client.get_server_metadata()
@@ -93,6 +102,7 @@ class ModelClient:
         self.episode_id = uuid.uuid4().hex
         self.pending_memory_feedback.clear()
         self.last_observation_state = None
+        self.last_observation_visual_tokens = None
         self.last_executed_action = None
 
     def step(
@@ -100,8 +110,15 @@ class ModelClient:
         example: dict,
         step: int = 0,
     ) -> np.ndarray:
-        state = example.get("state", None)
-        contract_state = None if state is None else np.asarray(state, dtype=np.float32)[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
+        if not isinstance(example, dict):
+            raise TypeError(f"RobotWin example must be a dict, got {type(example).__name__}")
+        state = example.get("state")
+        if state is None:
+            raise ValueError("RobotWin memory evaluation requires a 14D state")
+        state = np.asarray(state, dtype=np.float32)
+        if state.shape != (14,) or not np.isfinite(state).all():
+            raise ValueError(f"RobotWin state must be finite shape (14,), got {state.shape}")
+        contract_state = state[self._STATE_TO_CONTRACT]
         # if state is not None:
         #     state = self.normalize_state(state, self.state_norm_stats)
         #     state = state[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
@@ -114,7 +131,15 @@ class ModelClient:
             self.initial_state = np.array(state).copy()
 
         task_description = example.get("lang", None)
-        images = example["image"]
+        images = example.get("image")
+        if not isinstance(images, (list, tuple)) or len(images) != 3:
+            raise ValueError("RobotWin memory evaluation requires exactly 3 images: head, left wrist, right wrist")
+        for index, image in enumerate(images):
+            value = np.asarray(image)
+            if value.ndim != 3 or value.shape[-1] != 3:
+                raise ValueError(f"RobotWin image[{index}] must be HWC RGB, got {value.shape}")
+            if value.dtype != np.uint8:
+                raise ValueError(f"RobotWin image[{index}] must be uint8 RGB, got {value.dtype}")
 
         if example is not None:
             if task_description != self.task_description:
@@ -123,15 +148,25 @@ class ModelClient:
                 if self.action_mode in ["delta", "rel"] and state is not None:
                     self.initial_state = np.array(state).copy()
 
+        # Build memory patches from the original RGB observations using the
+        # same shared transform as offline sidecar preprocessing. The policy's
+        # ordinary vision input remains at the configured 224x224 resolution.
+        visual_tokens = np.stack([
+            image_to_memory_tokens(np.asarray(image), resize_size=256)
+            for image in images
+        ])
         images = [self._resize_image(image) for image in images]
         example["image"] = images
         if self.episode_id is None:
             self.reset(task_description)
         if step > 0 and self.last_observation_state is not None and self.last_executed_action is not None:
+            if self.last_observation_visual_tokens is None:
+                raise RuntimeError("Missing visual patches for the previous observation memory record")
             self.pending_memory_feedback.append({
                 "source_step": int(step - 1),
                 "state": self.last_observation_state.tolist(),
                 "executed_action": self.last_executed_action.tolist(),
+                "visual_tokens": self.last_observation_visual_tokens.copy(),
             })
         example_copy = {"image": example["image"], "lang": task_description,
                         "env_id": self.env_id, "episode_id": self.episode_id,
@@ -160,7 +195,18 @@ class ModelClient:
             # ==============================================================================
             response = self.client.predict_action(vla_input)
             # server already un-normalized via training-time transform
-            raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
+            raw_actions = np.asarray(response["data"]["actions"], dtype=np.float32)
+            if raw_actions.ndim != 3 or raw_actions.shape[0] != 1 or raw_actions.shape[2] != 14:
+                raise ValueError(
+                    "RobotWin policy must return actions with shape (1, horizon, 14), "
+                    f"got {raw_actions.shape}"
+                )
+            raw_actions = raw_actions[0]
+            if raw_actions.shape[0] != action_chunk_size:
+                raise ValueError(
+                    f"Policy returned horizon {raw_actions.shape[0]}, expected server action_chunk_size "
+                    f"{action_chunk_size}"
+                )
             self.pending_memory_feedback.clear()
 
             # Convert delta/rel to absolute actions
@@ -183,8 +229,11 @@ class ModelClient:
 
         # Dataset/model order [left arm, left gripper, right arm, right gripper]
         # is converted back to RoboTwin's environment order [left arm, right arm, grippers].
-        env_action = current_action[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
+        if current_action.shape != (14,) or not np.isfinite(current_action).all():
+            raise ValueError(f"Policy action must be finite shape (14,), got {current_action.shape}")
+        env_action = current_action[self._ACTION_TO_ENV]
         self.last_observation_state = contract_state.copy()
+        self.last_observation_visual_tokens = visual_tokens.copy()
         self.last_executed_action = current_action.astype(np.float32, copy=True)
         return env_action
 

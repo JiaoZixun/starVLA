@@ -2,6 +2,8 @@
 # Licensed under the MIT License, Version 1.0 (the "License");
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
+import os
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -22,6 +24,41 @@ _ACTION_TOKEN_MIN = 151669  # how can we know this range? check how you add fast
 _ACTION_TOKEN_MAX = (
     153716  # here only for fast_tokenizer, see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md
 )
+
+
+def _resolve_vlm_model_id(model_id: str) -> str:
+    """Resolve repository-local model paths before calling Transformers.
+
+    Transformers treats a missing local path as a Hub repo id.  That turns a
+    simple missing/mis-mounted checkpoint into a misleading ``HFValidationError``.
+    Keep Hub ids untouched, but make paths such as ``playground/...`` explicit
+    and fail with the path the operator needs to fix.
+    """
+    override = os.environ.get("STARVLA_BASE_VLM")
+    if override:
+        model_id = override
+
+    candidate = Path(model_id).expanduser()
+    # Hub ids use the same slash syntax (for example ``Qwen/Qwen3-VL-4B``),
+    # so only classify explicit filesystem-style prefixes as local paths.
+    looks_like_path = candidate.is_absolute() or model_id.startswith((".", "/", "playground/", "checkpoints/"))
+    if not looks_like_path:
+        return model_id
+
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates = [candidate]
+    if not candidate.is_absolute():
+        candidates.extend([Path.cwd() / candidate, repo_root / candidate])
+    for path in candidates:
+        if path.is_dir():
+            return str(path.resolve())
+
+    checked = ", ".join(str(path.resolve()) for path in candidates)
+    raise FileNotFoundError(
+        "Local Qwen3-VL checkpoint was not found. Checked: "
+        f"{checked}. Set STARVLA_BASE_VLM to the mounted checkpoint directory "
+        "or download/copy Qwen3-VL-4B-Instruct under playground/Pretrained_models."
+    )
 
 
 import torch.nn as nn
@@ -48,7 +85,7 @@ class _QWen3_VL_Interface(nn.Module):
         super().__init__()
 
         qwenvl_config = config.framework.get("qwenvl", {})
-        model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
+        model_id = _resolve_vlm_model_id(qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct"))
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
         attn_implementation = "sdpa"
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
