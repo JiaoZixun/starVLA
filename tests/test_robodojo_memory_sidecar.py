@@ -72,6 +72,20 @@ def test_linked_indices_match_online_every_frame_without_copying_original(source
         build_sidecar(source, output, spec)
 
 
+def test_unsupported_manifest_format_reports_detected_format(tmp_path):
+    sidecar = tmp_path / "sidecar"
+    sidecar.mkdir()
+    (sidecar / "manifest.json").write_text(json.dumps({
+        "format": "robodojo_causal_visual_memory", "format_version": 2,
+    }))
+
+    with pytest.raises(ValueError) as error:
+        RoboDojoMemorySidecar(sidecar, tmp_path / "source", RoboDojoMemorySpec())
+
+    assert "format='robodojo_causal_visual_memory'" in str(error.value)
+    assert "format_version=2" in str(error.value)
+
+
 @pytest.mark.parametrize("tamper", ["frame_gap", "nonfinite", "wrong_dim", "channel_order", "counts"])
 def test_bad_source_is_rejected_without_publishing_partial_output(source, tmp_path, tamper):
     path = source / "data/chunk-000/file-000.parquet"

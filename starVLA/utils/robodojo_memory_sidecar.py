@@ -387,7 +387,11 @@ class RoboDojoMemorySidecar:
         if (m.get("format"), m.get("format_version"), m.get("representation"), m.get("padding")) not in (
                 ("robodojo_causal_memory_indices", 1, REPRESENTATION, -1),
                 ("robodojo_causal_memory_indices", 2, REPRESENTATION, -1)):
-            raise ValueError("Unsupported memory sidecar format")
+            raise ValueError(
+                "Unsupported memory sidecar format: "
+                f"format={m.get('format')!r}, format_version={m.get('format_version')!r}; "
+                "expected robodojo_causal_memory_indices version 1 or 2"
+            )
         if (m.get("recent_records"), m.get("decision_stride_env_steps"), m.get("use_pose")) != (
                 spec.recent_records, spec.decision_stride, spec.use_pose):
             raise ValueError("Memory sidecar and model/dataset contracts differ")

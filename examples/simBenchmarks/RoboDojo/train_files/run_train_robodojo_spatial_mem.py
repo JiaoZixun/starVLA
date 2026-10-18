@@ -69,7 +69,7 @@ def main() -> None:
             f"framework.qwenvl.base_vlm={DATA_ROOT / 'base_model/Qwen3.5-0.8B'}",
             f"datasets.vla_data.data_root_dir={DATA_ROOT / 'data/starvla_robodojo_v30'}",
             f"datasets.vla_data.spatial_sidecar_dir={DATA_ROOT / 'data/starvla_robodojo_v30/spatial_sidecar'}",
-            f"datasets.vla_data.memory_sidecar_dir={DATA_ROOT / 'memory_sidecars/robodojo_v30_r16_s8_visual_v2'}",
+            f"datasets.vla_data.memory_sidecar_dir={DATA_ROOT / 'robodojo_v30_r16_s8_visual_v2'}",
             f"trainer.pretrained_checkpoint={DATA_ROOT / 'trained_checkpoint/robodojo_v30_qwen35_0p8b_oft/final_model/pytorch_model.pt'}",
         ]
     stage_a = paths + [item.lstrip('-') for item in shlex.split(os.environ.get("STAGE_A_OVERRIDES", ""))]
