@@ -59,7 +59,7 @@ datasets:
     memory_use_pose: false
     # Keep the micro-batch at one: longer video sequences can OOM on a V100
     # with larger micro-batches during full-parameter fine-tuning.
-    per_device_batch_size: 1
+    per_device_batch_size: 32
     load_all_data_for_training: false
     obs_image_size: [224, 224]
     video_backend: opencv
