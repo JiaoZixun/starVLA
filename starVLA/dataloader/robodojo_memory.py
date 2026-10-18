@@ -96,7 +96,9 @@ class RoboDojoMemorySingleDataset(LeRobotSingleDataset):
         result["state"] = np.stack(rows["observation.state"].to_numpy()).astype(np.float32)
         result["executed_actions"] = np.stack(rows["action"].to_numpy()).astype(np.float32)
         result["source_frame_index"] = indices
-        result["elapsed_env_steps"] = frame_index - indices
+        # Preserve the dtype declared by ``empty_burnin``. Replacing this
+        # array with the integer index difference promotes it to int64.
+        result["elapsed_env_steps"][:] = frame_index - indices
         if spec.use_pose:
             cached = self._spatial_episode_cache.get(int(trajectory_id))
             result["eef_pose"] = cached["pose"][indices]
