@@ -16,6 +16,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[3]
+sys.path.insert(0, str(SCRIPT_DIR.parent / "eval_files"))
+from robodojo_memory_eval_guard import ensure_legacy_robodojo_eval_compatible
+
 EVALUATOR = SCRIPT_DIR.parent / "eval_files/eval_qwen35_robodojo.py"
 BUNDLE = Path(os.environ.get(
     "ROBODOJO_SPATIAL_ROOT", "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013"
@@ -116,6 +119,10 @@ def main() -> None:
                        (LOCAL_PYTHON, "local Python")):
         if not path.exists():
             raise SystemExit(f"Missing {what}: {path}")
+
+    # Do this before the standalone model smoke test, which has no execution
+    # feedback and therefore cannot exercise a causal-memory checkpoint.
+    ensure_legacy_robodojo_eval_compatible(CHECKPOINT)
 
     if os.environ.get("SKIP_SMOKE_TEST") != "1":
         run([str(LOCAL_PYTHON), "-c", SMOKE_TEST, str(CHECKPOINT)], env=local_env())

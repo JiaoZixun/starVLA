@@ -174,6 +174,12 @@ GR00T ZMQ 接口将上述 env_id、episode_id、env_step、memory_feedback 放�
 旧的无反馈 RoboDojo 客户端需要接入此协议后才能使用 memory checkpoint；
 服务端会拒绝缺失反馈的请求，避免静默产生训练/推理偏差。
 
+当前仓库的官方 RoboDojo 评估入口仍委托旧版 XPolicyLab client，不能提交上述逐步执行
+反馈。评估脚本会读取 checkpoint 保存的 config，并在启动 smoke test 或仿真前拒绝
+`framework.memory.required=true` 的 checkpoint。训练数据和模型契约已验证，但在
+memory-aware RoboDojo client 接入并通过真实仿真 smoke test 前，不应把官方评估视为
+与训练一致或报告其成功率。
+
 ## 回归验证
 
 `tests/test_robodojo_memory_contract.py` 覆盖逐帧离线/在线一致性、padding/滚动/重置、
@@ -183,10 +189,26 @@ CUDA autocast/低精度参数。GR00T 协议测试覆盖执行反馈转发与标
 预处理测试还覆盖原始文件不变、symlink 挂载、校验值变化、行关联错误、当前/未来
 索引注入拒绝，以及实际 memory 加载器与在线 buffer 的逐帧一致性。
 
-本次 69 项回归测试全部通过。真实数据验证覆盖每个源 shard 的首尾 episode，
+历史 v1 记录中的 69 项回归测试和真实数据采样结果对应旧 sidecar，
+记录在 [`robodojo_memory_preprocessing_result.json`](robodojo_memory_preprocessing_result.json)，
+不作为新上传 v2 的验证凭据。
+
+## 上传 v2 数据验证
+
+2026-10-18 对上传的 `robodojo_v30_r16_s8_visual_v2` 完成全量校验：3,500 个
+episode、1,856,102 帧，索引与三相机视觉 sidecar 均通过校验，源 parquet 哈希和
+episode 行关联匹配，原始数据未变化。memory 契约与训练配置一致，46 项契约/sidecar
+回归测试及 3 项评估防误用测试通过。完整路径、契约和评估限制见
+[`robodojo_memory_v2_validation_result.json`](robodojo_memory_v2_validation_result.json)。
+
+新上传数据支持新架构 mem 训练；官方仿真评估尚不能宣称一致，因为 RoboDojo 仓库
+当前使用的 XPolicyLab client 仍未提供逐环境步执行反馈。评估入口现在会在旧客户端
+启动前拒绝 memory checkpoint；完成 memory-aware client 接入后，还需在 RoboDojo
+仿真环境运行 smoke test。
+
+之前的 v1 结果记录中，真实数据验证覆盖每个源 shard 的首尾 episode，
 共 6 个 episode、4,286 帧，历史记录逐帧与在线 buffer 完全相等；6 个三相机完整
 样本的当前 state 与 checkpoint 统计驱动的在线 q99 处理完全相等。真实 DataLoader
 以 4 workers、batch=16 完成加载；所有源 parquet 和元数据的验证前后 SHA256
-保持不变，全部 3,500 个索引文件通过校验。结果记录在
-[`robodojo_memory_preprocessing_result.json`](robodojo_memory_preprocessing_result.json)。
+保持不变，全部 3,500 个索引文件通过校验。该记录只描述 v1 sidecar。
 本次仅执行预处理与加载验证，未启动长时间训练。

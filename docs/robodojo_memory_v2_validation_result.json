@@ -1,0 +1,84 @@
+{
+  "validation_date": "2026-10-18",
+  "branch": "robodojo-spatial-mem",
+  "base_commit": "27173354297633bc5b2804a09efc13c94432457e",
+  "source_dataset": "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/data/starvla_robodojo_v30/RoboDojo_lerobot_v30_video",
+  "uploaded_memory_sidecar": "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/robodojo_v30_r16_s8_visual_v2",
+  "configured_memory_sidecar": "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/memory_sidecars/robodojo_v30_r16_s8_visual_v2",
+  "configured_sidecar_resolves_to_upload": true,
+  "source_dataset_link_resolves_to_source": true,
+  "source_identity_sha256": "b8b59598e98e1268f4920d1a72deee6fa6b9cc12118edcaefaf9cc1271ecfa4f",
+  "dataset": {
+    "episodes": 3500,
+    "frames": 1856102,
+    "state_action_dim": 14,
+    "representation": "raw_dual_arm_abs_qpos_v1",
+    "channel_order": [
+      "left_joints_0:6",
+      "left_gripper",
+      "right_joints_0:6",
+      "right_gripper"
+    ]
+  },
+  "memory_contract": {
+    "recent_records": 16,
+    "decision_stride_env_steps": 8,
+    "use_pose": false,
+    "camera_order": [
+      "cam_high",
+      "cam_left_wrist",
+      "cam_right_wrist"
+    ],
+    "visual_dtype": "uint8",
+    "visual_shape_per_frame": [
+      3,
+      8,
+      8,
+      8,
+      3
+    ],
+    "visual_encoding": "ordered_rgb_2x4_box_8x8",
+    "history_rule": "current_step - 8 * [16, 15, ..., 1]; negative indices are zero padded",
+    "history_state_action_normalization": "none; current state/action use original training q99"
+  },
+  "full_sidecar_validation": {
+    "status": "passed",
+    "episodes_checked": 3500,
+    "frames_checked": 1856102,
+    "indices_checked": true,
+    "visual_sidecars_checked": true,
+    "source_parquet_hashes_and_episode_row_links_checked": true,
+    "original_data_unchanged": true,
+    "command": "prepare_memory_sidecar.py --validate --recent-records 16 --decision-stride 8"
+  },
+  "regression_tests": {
+    "memory_contract_and_sidecar": {
+      "passed": 46,
+      "command": "pytest -q tests/test_robodojo_memory_contract.py tests/test_robodojo_memory_sidecar.py"
+    },
+    "legacy_evaluation_guard": {
+      "passed": 3,
+      "command": "pytest -q tests/test_robodojo_memory_eval_guard.py"
+    }
+  },
+  "training": {
+    "data_contract_supported": true,
+    "launcher_validates_sidecar_before_training": true,
+    "long_training_started": false
+  },
+  "evaluation": {
+    "serving_memory_protocol_matches_training_contract": true,
+    "official_simulation_evaluation_status": "blocked_until_memory_aware_client_is_integrated",
+    "legacy_client_missing_fields": [
+      "env_id",
+      "episode_id",
+      "env_step",
+      "raw_state",
+      "per_step_executed_action_feedback",
+      "per_step_three_camera_feedback"
+    ],
+    "memory_checkpoint_fails_before_legacy_evaluation": true,
+    "simulator_checkout_available": false
+  },
+  "historical_v1_record_used_as_v2_evidence": false
+}

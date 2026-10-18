@@ -17,6 +17,7 @@ from packaging.version import Version
 from tqdm import tqdm
 
 from robodojo_eval_assets import format_bytes, inspect_eval_assets
+from robodojo_memory_eval_guard import ensure_legacy_robodojo_eval_compatible
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -92,6 +93,7 @@ def main() -> None:
     for required in ("config.yaml", "config.full.yaml", "dataset_statistics.json"):
         if not (checkpoint.parent.parent / required).is_file():
             raise FileNotFoundError(f"Checkpoint sidecar missing: {checkpoint.parent.parent / required}")
+    ensure_legacy_robodojo_eval_compatible(checkpoint)
     if not base_model.is_dir() or not (base_model / "config.json").is_file():
         raise FileNotFoundError(f"Local Qwen3.5 base model is incomplete: {base_model}")
     if not (policy_env / "bin/python").is_file() or not (sim_env / "bin/python").is_file():
