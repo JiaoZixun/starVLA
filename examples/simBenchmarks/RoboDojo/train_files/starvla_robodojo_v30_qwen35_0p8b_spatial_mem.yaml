@@ -66,7 +66,7 @@ datasets:
     persistent_workers: true
     prefetch_factor: 4
     memory_enabled: true
-    memory_sidecar_dir: /public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/robodojo_v30_r16_s8_visual_v2
+    memory_sidecar_dir: /public/home/jiaozixun/robodojo_spatial_training_bundle_20261013/memory_sidecars/robodojo_v30_r16_s8_visual_v2
     memory_recent_records: 16
     memory_decision_stride: 8
     memory_state_dim: 14

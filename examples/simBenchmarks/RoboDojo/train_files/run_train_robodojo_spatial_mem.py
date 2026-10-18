@@ -13,6 +13,10 @@ PROJECT_ROOT = SCRIPT_DIR.parents[3]
 CONFIG = Path(os.environ.get("CONFIG_YAML", SCRIPT_DIR / "starvla_robodojo_v30_qwen35_0p8b_spatial_mem.yaml")).resolve()
 PYTHON = Path(os.environ.get("PYTHON_BIN", "/public/home/jiaozixun/anaconda3/envs/hm_retarget_mamba/bin/python")).resolve()
 DATA_ROOT = Path(os.environ.get("ROBODOJO_SPATIAL_ROOT", "/public/home/jiaozixun/robodojo_spatial_training_bundle_20261013")).resolve()
+MEMORY_SIDECAR = Path(os.environ.get(
+    "ROBODOJO_MEMORY_SIDECAR_DIR",
+    DATA_ROOT / "memory_sidecars/robodojo_v30_r16_s8_visual_v2",
+)).resolve()
 
 
 def environment() -> dict[str, str]:
@@ -69,9 +73,11 @@ def main() -> None:
             f"framework.qwenvl.base_vlm={DATA_ROOT / 'base_model/Qwen3.5-0.8B'}",
             f"datasets.vla_data.data_root_dir={DATA_ROOT / 'data/starvla_robodojo_v30'}",
             f"datasets.vla_data.spatial_sidecar_dir={DATA_ROOT / 'data/starvla_robodojo_v30/spatial_sidecar'}",
-            f"datasets.vla_data.memory_sidecar_dir={DATA_ROOT / 'robodojo_v30_r16_s8_visual_v2'}",
+            f"datasets.vla_data.memory_sidecar_dir={MEMORY_SIDECAR}",
             f"trainer.pretrained_checkpoint={DATA_ROOT / 'trained_checkpoint/robodojo_v30_qwen35_0p8b_oft/final_model/pytorch_model.pt'}",
         ]
+    elif "ROBODOJO_MEMORY_SIDECAR_DIR" in os.environ:
+        paths.append(f"datasets.vla_data.memory_sidecar_dir={MEMORY_SIDECAR}")
     stage_a = paths + [item.lstrip('-') for item in shlex.split(os.environ.get("STAGE_A_OVERRIDES", ""))]
     cfg = resolve_config(stage_a, env)
     sidecar = cfg["datasets"]["vla_data"]["spatial_sidecar_dir"]
