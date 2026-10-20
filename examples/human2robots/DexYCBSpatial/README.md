@@ -24,7 +24,7 @@ CUDA_VISIBLE_DEVICES=0 \
 STARVLA_DISABLE_DEEPSPEED=1 \
 WANDB_MODE=disabled \
 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
-/home/data/Libero/envs/libero-baselines/bin/python \
+/home/data/Libero/envs/mint-light/bin/python \
   starVLA/training/train_starvla.py \
   --config_yaml examples/human2robots/DexYCBSpatial/train_files/train_human_spatial.yaml
 ```
