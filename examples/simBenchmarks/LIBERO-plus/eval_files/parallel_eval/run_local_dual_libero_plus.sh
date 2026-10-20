@@ -16,7 +16,8 @@ NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-1}"
 TASKS_PER_GPU="${TASKS_PER_GPU:-1}"
 SAVE_VIDEOS="${SAVE_VIDEOS:-0}"
 MODEL_SELECTION="${MODEL_SELECTION:-both}"
-PYTHONUNBUFFERED=1
+EVAL_GPU_ID="${EVAL_GPU_ID:-1}"
+export PYTHONUNBUFFERED=1
 
 SUITES=(libero_10 libero_goal libero_object libero_spatial)
 declare -A SUITE_TASKS=(
@@ -37,12 +38,20 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 [[ "${TASKS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] || fail "TASKS_PER_GPU must be a positive integer."
 [[ "${SAVE_VIDEOS}" =~ ^[01]$ ]] || fail "SAVE_VIDEOS must be 0 or 1."
 [[ "${MODEL_SELECTION}" =~ ^(baseline|spatial|both)$ ]] || fail "MODEL_SELECTION must be baseline, spatial, or both."
+[[ "${EVAL_GPU_ID}" =~ ^[0-9]+$ ]] || fail "EVAL_GPU_ID must be a non-negative GPU index."
 command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi is required."
+nvidia-smi --query-gpu=index --format=csv,noheader,nounits \
+  | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "${EVAL_GPU_ID}" \
+  || fail "GPU ${EVAL_GPU_ID} is unavailable."
 
-[[ -s "${BASELINE_CKPT}" ]] || fail "Checkpoint is missing or empty: ${BASELINE_CKPT}"
-[[ "$(stat -c '%s' "${BASELINE_CKPT}")" == "1748288891" ]] || fail "Baseline checkpoint has an unexpected size: ${BASELINE_CKPT}"
-[[ -s "${SPATIAL_CKPT}" ]] || fail "Checkpoint is missing or empty: ${SPATIAL_CKPT}"
-[[ "$(stat -c '%s' "${SPATIAL_CKPT}")" == "1761788779" ]] || fail "Spatial checkpoint has an unexpected size: ${SPATIAL_CKPT}"
+if [[ "${MODEL_SELECTION}" == baseline || "${MODEL_SELECTION}" == both ]]; then
+  [[ -s "${BASELINE_CKPT}" ]] || fail "Checkpoint is missing or empty: ${BASELINE_CKPT}"
+  [[ "$(stat -c '%s' "${BASELINE_CKPT}")" == "1748288891" ]] || fail "Baseline checkpoint has an unexpected size: ${BASELINE_CKPT}"
+fi
+if [[ "${MODEL_SELECTION}" == spatial || "${MODEL_SELECTION}" == both ]]; then
+  [[ -s "${SPATIAL_CKPT}" ]] || fail "Checkpoint is missing or empty: ${SPATIAL_CKPT}"
+  [[ "$(stat -c '%s' "${SPATIAL_CKPT}")" == "1761788779" ]] || fail "Spatial checkpoint has an unexpected size: ${SPATIAL_CKPT}"
+fi
 
 ASSET_ROOT="${LIBERO_HOME}/libero/libero/assets"
 for asset_dir in articulated_objects new_objects scenes textures; do
@@ -69,6 +78,7 @@ fi
 [[ -s "${MODEL_DIR}/tokenizer.json" ]] || fail "Qwen tokenizer missing from cache: ${MODEL_DIR}"
 
 export STARVLA_DIR LIBERO_HOME LIBERO_PYTHON MODEL_ID MODEL_DIR HF_HOME="${HF_CACHE}"
+export MODEL_SELECTION BASELINE_CKPT SPATIAL_CKPT
 export HF_HUB_CACHE="${HF_CACHE}/hub"
 export LIBERO_CONFIG_PATH="${LIBERO_HOME}/libero"
 export PYTHONPATH="${LIBERO_HOME}:${STARVLA_DIR}:${PYTHONPATH:-}"
@@ -144,14 +154,28 @@ for suite, n_expected in expected.items():
 print("LIBERO paths:", get_libero_path("assets"), get_libero_path("bddl_files"), get_libero_path("init_states"))
 PY
 
-for gpu in 0 1; do
-  nvidia-smi --query-gpu=index --format=csv,noheader,nounits | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq "${gpu}" || fail "GPU ${gpu} is unavailable."
-  echo "Checking NVIDIA EGL on physical GPU ${gpu}..."
-  CUDA_VISIBLE_DEVICES="${gpu}" MUJOCO_EGL_DEVICE_ID="${gpu}" "${LIBERO_PYTHON}" "${STARVLA_DIR}/examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py"
-done
+echo "Checking checkpoint compatibility with the current code (strict loading)..."
+"${LIBERO_PYTHON}" - <<'PY'
+import gc
+import os
+from starVLA.model.framework.base_framework import baseframework
 
-echo "Running one no-policy LIBERO-plus environment render smoke test on GPU 0..."
-CUDA_VISIBLE_DEVICES=0 MUJOCO_EGL_DEVICE_ID=0 "${LIBERO_PYTHON}" - <<'PY'
+selected = os.environ["MODEL_SELECTION"]
+for name, key in (("baseline", "BASELINE_CKPT"), ("spatial", "SPATIAL_CKPT")):
+    if selected not in (name, "both"):
+        continue
+    model = baseframework.from_pretrained(os.environ[key])
+    print(f"Strict checkpoint load OK: {name}, framework={type(model).__name__}")
+    del model
+    gc.collect()
+PY
+
+echo "Checking NVIDIA EGL on physical GPU ${EVAL_GPU_ID}..."
+CUDA_VISIBLE_DEVICES="${EVAL_GPU_ID}" MUJOCO_EGL_DEVICE_ID="${EVAL_GPU_ID}" "${LIBERO_PYTHON}" \
+  "${STARVLA_DIR}/examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py"
+
+echo "Running one no-policy LIBERO-plus environment render smoke test on GPU ${EVAL_GPU_ID}..."
+CUDA_VISIBLE_DEVICES="${EVAL_GPU_ID}" MUJOCO_EGL_DEVICE_ID="${EVAL_GPU_ID}" "${LIBERO_PYTHON}" - <<'PY'
 import json
 import os
 import io
@@ -183,6 +207,7 @@ PY
 echo "Preflight passed. No policy evaluation has been launched."
 echo "Result root: ${RESULT_ROOT}"
 echo "Checkpoints: ${BASELINE_CKPT} ; ${SPATIAL_CKPT}"
+echo "GPU: ${EVAL_GPU_ID}; four suites in parallel, ${TASKS_PER_GPU} worker(s) per suite."
 echo "Episodes per model: 10030 (${NUM_TRIALS_PER_TASK} per task)"
 echo "Video saving: ${SAVE_VIDEOS}"
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -190,15 +215,16 @@ if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
 fi
 
 launch_model() {
-  local model_name="$1" ckpt="$2" gpu="$3"
+  local model_name="$1" ckpt="$2"
   local model_out="${RESULT_ROOT}/${model_name}"
   mkdir -p "${model_out}"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Starting ${model_name} on GPU ${EVAL_GPU_ID}."
   local -a pids=()
   local -a suites=(libero_10 libero_goal libero_object libero_spatial)
   local suite
   for suite in "${suites[@]}"; do
     local total="${SUITE_TASKS[${suite}]}"
-    GPU_ID="${gpu}" tasks_per_gpu="${TASKS_PER_GPU}" your_ckpt="${ckpt}" \
+    GPU_ID="${EVAL_GPU_ID}" tasks_per_gpu="${TASKS_PER_GPU}" your_ckpt="${ckpt}" \
       output_dir="${model_out}" SAVE_VIDEOS="${SAVE_VIDEOS}" \
       "${SCRIPT_DIR}/eval_libero_in_one.sh" "${suite}" 0 "${total}" \
       >"${model_out}/${suite}.launcher.log" 2>&1 &
@@ -208,6 +234,10 @@ launch_model() {
   for pid in "${pids[@]}"; do
     wait "${pid}" || failed=1
   done
+  if (( failed == 0 )); then
+    "${LIBERO_PYTHON}" "${SCRIPT_DIR}/aggregate_results.py" --root_path "${model_out}" || failed=1
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Finished ${model_name} (status=${failed})."
   return "${failed}"
 }
 
@@ -215,16 +245,14 @@ baseline_status=0
 spatial_status=0
 case "${MODEL_SELECTION}" in
   baseline)
-    launch_model baseline "${BASELINE_CKPT}" 0 || baseline_status=$?
+    launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
     ;;
   spatial)
-    launch_model spatial "${SPATIAL_CKPT}" 1 || spatial_status=$?
+    launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
     ;;
   both)
-    launch_model baseline "${BASELINE_CKPT}" 0 & baseline_pid=$!
-    launch_model spatial "${SPATIAL_CKPT}" 1 & spatial_pid=$!
-    wait "${baseline_pid}" || baseline_status=$?
-    wait "${spatial_pid}" || spatial_status=$?
+    launch_model baseline "${BASELINE_CKPT}" || baseline_status=$?
+    launch_model spatial "${SPATIAL_CKPT}" || spatial_status=$?
     ;;
 esac
 
