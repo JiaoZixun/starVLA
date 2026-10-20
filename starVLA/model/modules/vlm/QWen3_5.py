@@ -59,7 +59,13 @@ class _QWen3_5_VL_Interface(nn.Module):
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
         revision = qwenvl_config.get("revision")
-        hub_kwargs = {"revision": revision} if revision else {}
+        # Keep offline runs offline when a local model snapshot is configured.  This
+        # is especially important for the human-pretraining job: a missing optional
+        # processor file must not make Transformers fall back to the Hub.
+        local_files_only = bool(qwenvl_config.get("local_files_only", False))
+        hub_kwargs = {"local_files_only": local_files_only}
+        if revision:
+            hub_kwargs["revision"] = revision
 
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":

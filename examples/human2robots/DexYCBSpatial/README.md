@@ -29,6 +29,6 @@ PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
   --config_yaml examples/human2robots/DexYCBSpatial/train_files/train_human_spatial.yaml
 ```
 
-The Qwen backbone loads the original `Qwen/Qwen3.5-0.8B` weights directly through `framework.qwenvl.base_vlm` at the pinned revision. No LIBERO-trained checkpoint is loaded. The action head and spatial modules start from their configured initialization; the unused action head, robot spatial adapter, and robot anchor projection are frozen during human pretraining. `eval_interval: 0` disables robot action evaluation; provide an independent geometry validation workflow before selecting a human checkpoint.
+The Qwen backbone loads the original 0.8B weights from the local snapshot configured in `framework.qwenvl.base_vlm` with `local_files_only: true`; no Hugging Face Hub access or LIBERO-trained checkpoint is used for human initialization. The action head and spatial modules start from their configured initialization; the unused action head, robot spatial adapter, and robot anchor projection are frozen during human pretraining. `eval_interval: 0` disables robot action evaluation; provide an independent geometry validation workflow before selecting a human checkpoint.
 
 After the 50-epoch run, `train_files/train_libero_after_human.yaml` loads its full checkpoint directly and trains on the existing `libero_spatial_oft_all` dataset with its existing pose sidecars and action statistics. Its action head starts from the human-stage initialization and is trained by LIBERO behavior cloning.

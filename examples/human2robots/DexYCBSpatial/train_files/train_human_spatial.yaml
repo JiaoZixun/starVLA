@@ -6,9 +6,9 @@ is_debug: false
 framework:
   name: QwenSpatialOFT
   qwenvl:
-    base_vlm: Qwen/Qwen3.5-0.8B
+    base_vlm: /home/jiao/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
     attn_implementation: sdpa
-    revision: 2fc06364715b967f1860aea9cf38778875588b17
+    local_files_only: true
     gradient_checkpointing: false
   action_model:
     action_dim: 7
