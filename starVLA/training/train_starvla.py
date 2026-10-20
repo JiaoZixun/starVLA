@@ -371,7 +371,9 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            eval_interval = int(getattr(self.config.trainer, "eval_interval", 0) or 0)
+            task_mode = str(getattr(self.config.trainer, "task_mode", "robot_policy"))
+            if eval_interval > 0 and self.completed_steps % eval_interval == 0 and task_mode != "human_geometry_pretrain":
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
@@ -423,6 +425,8 @@ class VLATrainer(TrainerUtils):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict.get("bc_loss", output_dict.get("action_loss"))
+                if action_loss is None and not output_dict.get("has_robot_action", False):
+                    action_loss = output_dict.get("total_loss", None)
                 if action_loss is None:
                     raise KeyError("Model forward must return `bc_loss` or legacy `action_loss`")
                 total_loss = output_dict.get("total_loss", action_loss)
@@ -443,7 +447,9 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        metrics = {"action_dit_loss": action_loss.item(), "total_loss": total_loss.detach().item()}
+        metrics = {"total_loss": total_loss.detach().item()}
+        if output_dict.get("has_robot_action", True):
+            metrics["action_dit_loss"] = action_loss.detach().item()
         for key in (
             "waypoint_loss",
             "waypoint_translation_loss",

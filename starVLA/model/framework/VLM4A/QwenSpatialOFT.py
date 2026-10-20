@@ -32,9 +32,10 @@ class WaypointDecoderBlock(nn.Module):
         self.ffn_norm = nn.LayerNorm(width)
         self.ffn = nn.Sequential(nn.Linear(width, ffn_width), nn.GELU(), nn.Linear(ffn_width, width))
 
-    def forward(self, queries: torch.Tensor, memory: torch.Tensor, memory_padding_mask: torch.Tensor | None) -> torch.Tensor:
+    def forward(self, queries: torch.Tensor, memory: torch.Tensor, memory_padding_mask: torch.Tensor | None,
+                self_attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         normalized = self.query_norm(queries)
-        attended, _ = self.self_attention(normalized, normalized, normalized, need_weights=False)
+        attended, _ = self.self_attention(normalized, normalized, normalized, attn_mask=self_attention_mask, need_weights=False)
         queries = queries + attended
         normalized_memory = self.memory_norm(memory)
         attended, _ = self.cross_attention(
@@ -53,7 +54,9 @@ class WaypointModel(nn.Module):
         self.width = width
         self.memory_projection = nn.Linear(vlm_width, width)
         self.anchor_projection = nn.Sequential(nn.Linear(9, width), nn.GELU(), nn.Linear(width, width))
+        self.human_anchor_projection = nn.Sequential(nn.Linear(9, width), nn.GELU(), nn.Linear(width, width))
         self.arm_embedding = nn.Embedding(2, width)
+        self.human_side_embedding = nn.Embedding(3, width)
         self.time_projection = nn.Sequential(nn.Linear(1, width), nn.GELU(), nn.Linear(width, width))
         self.decoder = nn.ModuleList([WaypointDecoderBlock(width, heads, ffn_width) for _ in range(layers)])
         self.output_norm = nn.LayerNorm(width)
@@ -90,6 +93,24 @@ class WaypointModel(nn.Module):
         translation = self.translation_head(features)
         rotation = self.rotation_head(features)
         return translation, rotation
+
+    def forward_human(self, vlm_features, anchor_pose, side, tau, memory_attention_mask=None):
+        batch_size, effectors = anchor_pose.shape[:2]
+        rotation_6d = matrix_to_rotation_6d(anchor_pose[..., :3, :3])
+        anchor_features = torch.cat((anchor_pose[..., :3, 3].float(), rotation_6d), dim=-1)
+        times = tau.float().view(1, 1, -1, 1).expand(batch_size, effectors, -1, -1)
+        query = (self.human_anchor_projection(anchor_features).unsqueeze(2)
+                 + self.arm_embedding(torch.zeros((batch_size, effectors, 1), device=anchor_pose.device, dtype=torch.long))
+                 + self.human_side_embedding(side.long()).unsqueeze(2) + self.time_projection(times))
+        query = query.reshape(batch_size, effectors * self.num_waypoints, self.width)
+        memory = self.memory_projection(vlm_features)
+        padding_mask = None if memory_attention_mask is None else ~memory_attention_mask.to(torch.bool)
+        endpoint_ids = torch.arange(effectors, device=query.device).repeat_interleave(self.num_waypoints)
+        block_mask = endpoint_ids[:, None] != endpoint_ids[None, :]
+        for layer in self.decoder:
+            query = layer(query, memory, padding_mask, block_mask)
+        features = self.output_norm(query).reshape(batch_size, effectors, self.num_waypoints, self.width)
+        return self.translation_head(features), self.rotation_head(features)
 
 
 class SpatialAdapter(nn.Module):
@@ -180,9 +201,13 @@ class QwenSpatialOFT(Qwenvl_OFT):
         state = [example["state"] for example in examples] if "state" in examples[0] else None
         if state is not None:
             instructions = self.add_discretized_state_to_instruction(instructions, state)
-        action_tokens = self.action_token * self.chunk_len
-        prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
-        instructions = [instruction + prompt_suffix for instruction in instructions]
+        human_batch = examples[0].get("domain") == "human"
+        if any((example.get("domain") == "human") != human_batch for example in examples):
+            raise ValueError("A batch must contain one domain; use homogeneous human or robot batches")
+        if not human_batch:
+            action_tokens = self.action_token * self.chunk_len
+            prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
+            instructions = [instruction + prompt_suffix for instruction in instructions]
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.qwen_vl_interface(
@@ -207,6 +232,10 @@ class QwenSpatialOFT(Qwenvl_OFT):
 
     def _predict_from_features(self, examples: list[dict], qwen_inputs: dict, last_hidden: torch.Tensor, *, train: bool):
         device = last_hidden.device
+        if examples[0].get("domain") == "human":
+            if not train:
+                raise ValueError("Human geometry batches are training-only")
+            return self._human_geometry_loss(examples, qwen_inputs, last_hidden)
         anchor_pose = self._batch_geometry_current(examples, device)
         tau = torch.tensor(self.waypoint_tau, device=device, dtype=torch.float32) / float(self.action_horizon)
         # Keep the OFT action queries for the original action head and adapter, while the
@@ -287,6 +316,37 @@ class QwenSpatialOFT(Qwenvl_OFT):
             "action_geometry_loss": action_geometry_loss,
             "spatial_residual_ratio": residual_ratio,
         }
+
+    def _human_geometry_loss(self, examples, qwen_inputs, last_hidden):
+        device = last_hidden.device
+        current = torch.as_tensor(np.stack([x["geometry_current"]["effector_pose"] for x in examples]), device=device, dtype=torch.float32)
+        side = torch.as_tensor(np.stack([x["effector_type"] for x in examples]), device=device, dtype=torch.long)
+        targets = torch.as_tensor(np.stack([x["geometry_labels"]["relative_waypoints"] for x in examples]), device=device, dtype=torch.float32)
+        pos_mask = torch.as_tensor(np.stack([x["geometry_labels"]["position_valid"] for x in examples]), device=device, dtype=torch.bool)
+        rot_mask = torch.as_tensor(np.stack([x["geometry_labels"]["rotation_valid"] for x in examples]), device=device, dtype=torch.bool)
+        tau = torch.tensor(self.waypoint_tau, device=device, dtype=torch.float32) / float(self.action_horizon)
+        attention = qwen_inputs.get("attention_mask")
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            translation, rotation = self.waypoint_model.forward_human(last_hidden, current, side, tau, attention)
+        pred_pose = torch.eye(4, device=device, dtype=torch.float32).view(1, 1, 1, 4, 4).repeat(len(examples), current.shape[1], len(self.waypoint_tau), 1, 1)
+        pred_pose[..., :3, :3] = rotation_6d_to_matrix(rotation)
+        pred_pose[..., :3, 3] = translation.float()
+        pos_error = torch.nn.functional.huber_loss(translation.float() / 0.1, targets[..., :3, 3] / 0.1, reduction="none", delta=1.0).mean(-1)
+        rot_error = (pred_pose[..., :3, :3] - targets[..., :3, :3]).square().mean(dim=(-2, -1))
+        def endpoint_balanced_mean(value, mask):
+            weights = mask.to(value.dtype)
+            per_endpoint = (value * weights).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1.0)
+            endpoint_valid = (weights.sum(dim=-1) > 0).to(value.dtype)
+            per_scene = (per_endpoint * endpoint_valid).sum(dim=-1) / endpoint_valid.sum(dim=-1).clamp_min(1.0)
+            scene_valid = (endpoint_valid.sum(dim=-1) > 0).to(value.dtype)
+            return (per_scene * scene_valid).sum() / scene_valid.sum().clamp_min(1.0)
+        position_loss = endpoint_balanced_mean(pos_error, pos_mask)
+        rotation_loss = endpoint_balanced_mean(rot_error, rot_mask)
+        geometry_loss = position_loss + self.waypoint_rotation_weight * rotation_loss
+        # Trainer interface placeholder only; no human action target is created or consumed.
+        return {"total_loss": self.waypoint_weight * geometry_loss, "bc_loss": geometry_loss.detach() * 0,
+                "has_robot_action": False, "waypoint_loss": geometry_loss,
+                "waypoint_translation_loss": position_loss, "waypoint_rotation_loss": rotation_loss}
 
     def forward(self, examples: list[dict] = None, **kwargs):
         qwen_inputs, last_hidden = self._build_inputs(examples)
