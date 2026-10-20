@@ -5,7 +5,7 @@ import torch
 import pytest
 from torch.utils.data import DataLoader, Dataset
 
-from starVLA.training.train_starvla import VLATrainer
+from starVLA.training.train_starvla import VLATrainer, accelerator
 
 
 class _IndexDataset(Dataset):
@@ -125,3 +125,42 @@ def test_epoch_resume_rejects_mid_epoch_checkpoint(tmp_path):
         assert "only supports complete epoch boundaries" in str(error)
     else:
         raise AssertionError("mid-epoch resume must fail with an explicit boundary-only message")
+
+
+def test_train_step_retains_gradients_across_microbatches():
+    class TinyGeometryModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, batch):
+            return {"total_loss": (self.weight * batch).mean(), "has_robot_action": False}
+
+    previous_accumulation = accelerator.gradient_accumulation_steps
+    accelerator.gradient_accumulation_steps = 4
+    try:
+        model = TinyGeometryModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        loader = DataLoader(torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]), batch_size=1)
+        model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+        trainer = VLATrainer.__new__(VLATrainer)
+        trainer.model = model
+        trainer.optimizer = optimizer
+        trainer.accelerator = accelerator
+        trainer.config = SimpleNamespace(trainer=SimpleNamespace(gradient_clipping=None))
+        trainer.lr_scheduler = SimpleNamespace(step=lambda: None)
+        weights = []
+        update_count = 0
+        for batch in loader:
+            trainer._train_step(batch)
+            update_count += int(accelerator.sync_gradients)
+            weights.append(float(model.weight.detach()))
+
+        # First three microbatches must not update parameters. The fourth uses
+        # all four gradients, and the final partial window is flushed once.
+        assert weights[:3] == [1.0, 1.0, 1.0]
+        assert weights[3] == pytest.approx(0.75)
+        assert weights[4] == pytest.approx(0.625)
+        assert update_count == 2
+    finally:
+        accelerator.gradient_accumulation_steps = previous_accumulation

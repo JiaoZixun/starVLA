@@ -481,8 +481,6 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict.get("bc_loss", output_dict.get("action_loss"))
@@ -496,7 +494,7 @@ class VLATrainer(TrainerUtils):
 
             self.accelerator.backward(total_loss)
 
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
@@ -507,6 +505,10 @@ class VLATrainer(TrainerUtils):
             # at min_lr well before max_train_steps is reached.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+            # AcceleratedOptimizer zeroes only at synchronization boundaries.
+            # Clearing before backward would discard the preceding microbatches
+            # on the last microbatch of every accumulation window.
+            self.optimizer.zero_grad()
 
         metrics = {"total_loss": total_loss.detach().item()}
         if output_dict.get("has_robot_action", True):
@@ -552,6 +554,16 @@ class VLATrainer(TrainerUtils):
 
 def main(cfg) -> None:
     logger.info("VLA Training :: Warming Up")
+
+    configured_accumulation = int(cfg.trainer.get("gradient_accumulation_steps", 1))
+    if configured_accumulation < 1:
+        raise ValueError(
+            f"trainer.gradient_accumulation_steps must be positive, got {configured_accumulation}"
+        )
+    # Accelerator is constructed at module import time, before the YAML config is
+    # loaded. Apply the configured accumulation value before preparing the model,
+    # optimizer, and dataloader so effective batch size matches the training YAML.
+    accelerator.gradient_accumulation_steps = configured_accumulation
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
