@@ -93,7 +93,9 @@ def setup_directories(cfg) -> Path:
 
 def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     """Prepare VLA training data."""
-    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
+    data_cfg = cfg.datasets.vla_data
+    dataset_name = data_cfg.get("data_mix", data_cfg.get("dataset_py", "custom dataset"))
+    logger.info(f"Creating VLA Dataset `{dataset_name}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
