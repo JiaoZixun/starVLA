@@ -57,8 +57,9 @@ trainer:
   scheduler_specific_kwargs: {}
   freeze_modules: action_model,spatial_adapter,waypoint_model.anchor_projection
   is_resume: false
-  pretrained_checkpoint: playground/Checkpoints/qwen35_0p8b_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt
-  reload_modules: qwen_vl_interface,action_model
+  # Qwen3.5-0.8B is loaded directly by qwenvl.base_vlm above; no StarVLA/LIBERO checkpoint is used.
+  pretrained_checkpoint: null
+  reload_modules: null
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

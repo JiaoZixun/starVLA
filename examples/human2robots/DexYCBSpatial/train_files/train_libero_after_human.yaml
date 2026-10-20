@@ -1,4 +1,4 @@
-run_id: qwen35_0p8b_libero_after_dexycb_h100_spatial
+run_id: qwen35_0p8b_libero_after_dexycb_h500_spatial
 run_root_dir: playground/Checkpoints
 seed: 42
 is_debug: false
@@ -58,7 +58,7 @@ trainer:
     min_lr: 1.0e-6
   freeze_modules: waypoint_model.human_anchor_projection,waypoint_model.human_side_embedding
   is_resume: false
-  pretrained_checkpoint: playground/Checkpoints/qwen35_0p8b_dexycb_h100_geometry_pretrain/composed_for_libero_pytorch_model.pt
+  pretrained_checkpoint: playground/Checkpoints/qwen35_0p8b_dexycb_h500_geometry_e50/checkpoints/steps_49600_pytorch_model.pt
   reload_modules: null
   loss_scale:
     vla: 1.0

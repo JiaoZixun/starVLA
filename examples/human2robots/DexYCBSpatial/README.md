@@ -26,19 +26,9 @@ WANDB_MODE=disabled \
 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
 /home/data/Libero/envs/libero-baselines/bin/python \
   starVLA/training/train_starvla.py \
-  --config_yaml examples/human2robots/DexYCBSpatial/train_files/train_human_spatial.yaml \
-  trainer.pretrained_checkpoint=/absolute/path/to/libero_qwen35_0p8b_baseline/checkpoints/steps_50000_pytorch_model.pt
+  --config_yaml examples/human2robots/DexYCBSpatial/train_files/train_human_spatial.yaml
 ```
 
-The config initializes Qwen and the action head from the fixed LIBERO baseline, while freezing the action head, robot spatial adapter, and robot anchor projection. `eval_interval: 0` disables robot action evaluation; provide an independent geometry validation workflow before selecting a human checkpoint. Replace the checkpoint override with the actual LIBERO baseline checkpoint path before launching.
+The Qwen backbone loads the original `Qwen/Qwen3.5-0.8B` weights directly through `framework.qwenvl.base_vlm` at the pinned revision. No LIBERO-trained checkpoint is loaded. The action head and spatial modules start from their configured initialization; the unused action head, robot spatial adapter, and robot anchor projection are frozen during human pretraining. `eval_interval: 0` disables robot action evaluation; provide an independent geometry validation workflow before selecting a human checkpoint.
 
-Before LIBERO training, compose the human checkpoint with the same fixed baseline action head:
-
-```bash
-python examples/human2robots/DexYCBSpatial/compose_checkpoint.py \
-  --human-checkpoint playground/Checkpoints/<human-run>/checkpoints/steps_5000_pytorch_model.pt \
-  --robot-baseline playground/Checkpoints/qwen35_0p8b_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt \
-  --output playground/Checkpoints/<human-run>/composed_for_libero_pytorch_model.pt
-```
-
-Then run `train_files/train_libero_after_human.yaml`, pointing `pretrained_checkpoint` at that output. The LIBERO dataset remains the existing `libero_spatial_oft_all` with its existing pose sidecars and action statistics.
+After the 50-epoch run, `train_files/train_libero_after_human.yaml` loads its full checkpoint directly and trains on the existing `libero_spatial_oft_all` dataset with its existing pose sidecars and action statistics. Its action head starts from the human-stage initialization and is trained by LIBERO behavior cloning.
