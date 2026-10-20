@@ -15,6 +15,11 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
+def collate_human_wrist_batch(batch):
+    """Keep human samples as a list, without importing the LIBERO data stack."""
+    return batch
+
+
 class HumanWristGeometryDataset(Dataset):
     def __init__(self, data_root_dir, sequence_manifest, geometry_sidecar_root=None, waypoint_tau=(1, 2, 4, 8), **kwargs):
         self.root = Path(data_root_dir).expanduser().resolve()

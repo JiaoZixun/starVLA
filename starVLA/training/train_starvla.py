@@ -143,6 +143,8 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self.resume_epoch = 0
+        self.resume_batch = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -246,8 +248,10 @@ class VLATrainer(TrainerUtils):
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
                 self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
+                self._restore_epoch_cursor(self.resume_from_checkpoint)
                 logger.info(
-                    f"Resuming training from checkpoint: {self.resume_from_checkpoint}, steps: {self.completed_steps}"
+                    f"Resuming training from checkpoint: {self.resume_from_checkpoint}, "
+                    f"steps: {self.completed_steps}, epoch: {self.resume_epoch}, batch: {self.resume_batch}"
                 )
                 return
 
@@ -263,6 +267,23 @@ class VLATrainer(TrainerUtils):
         else:
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
+
+    def _restore_epoch_cursor(self, checkpoint_path):
+        """Resume epoch-mode training only from complete epoch boundaries."""
+        if getattr(self.config.trainer, "max_train_epochs", None) is None:
+            return
+
+        batches_per_epoch = len(self.vla_train_dataloader)
+        accumulation = int(self.config.trainer.gradient_accumulation_steps)
+        steps_per_epoch = math.ceil(batches_per_epoch / accumulation)
+        if self.completed_steps % steps_per_epoch:
+            raise ValueError(
+                f"Checkpoint {checkpoint_path} is at step {self.completed_steps}, which is not a full epoch "
+                f"boundary ({steps_per_epoch} optimizer steps per epoch). Epoch-mode resume only supports "
+                "complete epoch boundaries; use a full-epoch checkpoint or restart the run."
+            )
+        self.resume_epoch = self.completed_steps // steps_per_epoch
+        self.resume_batch = 0
 
     def _adjust_lr_scheduler_for_resume(self):
         """Adjust LR scheduler state after resuming from non-zero steps."""
@@ -349,6 +370,10 @@ class VLATrainer(TrainerUtils):
         max_train_epochs = getattr(self.config.trainer, "max_train_epochs", None)
         if max_train_epochs is None:
             self._create_data_iterators()
+        else:
+            self._restore_epoch_cursor(getattr(self, "resume_from_checkpoint", "current training state"))
+            if self.completed_steps > self.config.trainer.max_train_steps:
+                raise ValueError("Checkpoint progress exceeds the configured total training steps")
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
             initial=self.completed_steps,
@@ -383,16 +408,28 @@ class VLATrainer(TrainerUtils):
             step_metrics["timing/model"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if (
+                max_train_epochs is None
+                and self.completed_steps % self.config.trainer.save_interval == 0
+                and self.completed_steps > 0
+            ):
                 self._save_checkpoint()
 
         if max_train_epochs is not None:
             task_mode = str(getattr(self.config.trainer, "task_mode", "robot_policy"))
             if task_mode != "human_geometry_pretrain":
                 raise ValueError("max_train_epochs is currently supported only for human_geometry_pretrain")
-            for epoch_index in range(int(max_train_epochs)):
+            resume_epoch = int(getattr(self, "resume_epoch", 0))
+            if resume_epoch > int(max_train_epochs):
+                raise ValueError(
+                    f"Checkpoint epoch {resume_epoch} exceeds configured max_train_epochs={max_train_epochs}"
+                )
+            for epoch_index in range(resume_epoch, int(max_train_epochs)):
                 if hasattr(self.vla_train_dataloader, "set_epoch"):
                     self.vla_train_dataloader.set_epoch(epoch_index)
+                generator = getattr(self.vla_train_dataloader, "generator", None)
+                if generator is not None:
+                    generator.manual_seed(int(getattr(self.config, "seed", 0)) + epoch_index)
                 batch_iterator = iter(self.vla_train_dataloader)
                 while True:
                     t_start_data = time.perf_counter()
@@ -401,6 +438,10 @@ class VLATrainer(TrainerUtils):
                     except StopIteration:
                         break
                     train_batch(batch_vla, t_start_data)
+                # Epoch-mode recovery intentionally supports full epoch boundaries
+                # only, so these checkpoints cannot cause data to be replayed.
+                if self.completed_steps > 0:
+                    self._save_checkpoint()
         else:
             while self.completed_steps < self.config.trainer.max_train_steps:
                 t_start_data = time.perf_counter()

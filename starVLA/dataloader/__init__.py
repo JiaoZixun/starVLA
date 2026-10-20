@@ -4,6 +4,7 @@ from accelerate.logging import get_logger
 import numpy as np
 from torch.utils.data import DataLoader
 import numpy as np
+import torch
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
@@ -36,8 +37,10 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
     if dataset_py == "human_wrist_dataset":
-        from starVLA.dataloader.human_wrist_dataset import HumanWristGeometryDataset
-        from starVLA.dataloader.lerobot_datasets import collate_fn
+        from starVLA.dataloader.human_wrist_dataset import (
+            HumanWristGeometryDataset,
+            collate_human_wrist_batch,
+        )
 
         data_cfg = cfg.datasets.vla_data
         dataset = HumanWristGeometryDataset(
@@ -49,11 +52,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         workers = int(data_cfg.get("num_workers", 4))
         kwargs = {
             "batch_size": int(data_cfg.per_device_batch_size),
-            "collate_fn": collate_fn,
+            "collate_fn": collate_human_wrist_batch,
             "num_workers": workers,
             "pin_memory": bool(data_cfg.get("pin_memory", True)),
             "shuffle": True,
             "drop_last": bool(data_cfg.get("drop_last", False)),
+            "generator": torch.Generator(),
         }
         if workers:
             kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))

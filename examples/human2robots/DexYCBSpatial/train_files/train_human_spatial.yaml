@@ -9,7 +9,7 @@ framework:
     base_vlm: /home/jiao/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
     attn_implementation: sdpa
     local_files_only: true
-    gradient_checkpointing: false
+    gradient_checkpointing: true
   action_model:
     action_dim: 7
     action_hidden_dim: 1024
@@ -34,7 +34,7 @@ datasets:
     geometry_sidecar_root: playground/DerivedData/dexycb_spatial_v1
     sequence_manifest: h500/samples.jsonl
     waypoint_tau: [1, 2, 4, 8]
-    per_device_batch_size: 32
+    per_device_batch_size: 8
     drop_last: false
     num_workers: 8
     pin_memory: true
@@ -47,7 +47,7 @@ trainer:
   max_train_epochs: 50
   max_train_steps: null  # Resolved as ceil(len(dataloader) / gradient_accumulation_steps) * max_train_epochs.
   num_warmup_steps: 500
-  save_interval: 992  # H500: ceil(31719 / 32) = 992 batches per epoch.
+  save_interval: 993  # ceil(ceil(31773 / 8) / 4) optimizer steps per epoch.
   eval_interval: 0
   learning_rate:
     base: 5.0e-5
@@ -65,9 +65,9 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   gradient_clipping: 1.0
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]
