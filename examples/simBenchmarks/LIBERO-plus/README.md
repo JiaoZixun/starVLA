@@ -92,6 +92,37 @@ These counts and the one-episode setting are defined by the parallel launcher's
 suite slices and `num_trials_per_task=1`; direct Python evaluator defaults are
 50 trials per task, so use the provided launchers for this protocol.
 
+### Local Spatial OFT evaluation on one GPU
+
+Use the `libero-0.8B-spatial` branch for the pure Spatial OFT checkpoint above.
+The `libero-0.8B-spatial-mem` branch changes the shared spatial architecture
+(including the spatial projection from 11 to 12 input features) and cannot
+strictly load this checkpoint. The local launcher checks strict checkpoint
+loading before starting workers; keep strict loading enabled.
+
+From the repository root, run:
+
+```bash
+MODEL_SELECTION=spatial EVAL_GPU_ID=0 TASKS_PER_GPU=2 SAVE_VIDEOS=0 \
+  bash examples/simBenchmarks/LIBERO-plus/eval_files/parallel_eval/run_local_dual_libero_plus.sh
+```
+
+`EVAL_GPU_ID` is the physical GPU index for both CUDA inference and NVIDIA EGL
+rendering. The launcher validates it with `nvidia-smi`, exports `MUJOCO_GL=egl`
+and `PYOPENGL_PLATFORM=egl`, pins `__EGL_VENDOR_LIBRARY_FILENAMES` to the NVIDIA
+GLVND JSON, and checks the selected `MUJOCO_EGL_DEVICE_ID` using
+`examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py` before evaluation.
+Add `PREFLIGHT_ONLY=1` to run checks without launching evaluation.
+
+The four suites run concurrently on the selected GPU. With `TASKS_PER_GPU=2`,
+there are eight workers in total, using the same midpoint slices as the local
+baseline evaluation. Keep this partition fixed when comparing results: sensor
+noise consumes a process-local random stream. `MODEL_SELECTION=both` evaluates
+the baseline and spatial models sequentially on the selected GPU. Results are
+aggregated automatically into `spatial/overall_results.json` under `RESULT_ROOT`.
+An earlier complete run on one A100 took about 27 hours; sensor-noise tasks
+dominate the tail, so standard LIBERO timings do not predict this duration.
+
 The evaluation should be run **from the repository root** using **two separate terminals**, one for each environment:  
 
 - **starVLA environment**: runs the inference server.  
