@@ -13,6 +13,7 @@ Conventions:
 # Standard Library
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -343,16 +344,16 @@ class VLATrainer(TrainerUtils):
     def train(self):
         """Execute training loop."""
         self._log_training_config()
-        self._create_data_iterators()
+        max_train_epochs = getattr(self.config.trainer, "max_train_epochs", None)
+        if max_train_epochs is None:
+            self._create_data_iterators()
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
             initial=self.completed_steps,
             disable=not self.accelerator.is_local_main_process,
         )
 
-        while self.completed_steps < self.config.trainer.max_train_steps:
-            t_start_data = time.perf_counter()
-            batch_vla = self._get_next_batch()
+        def train_batch(batch_vla, t_start_data):
             t_end_data = time.perf_counter()
 
             t_start_model = time.perf_counter()
@@ -383,8 +384,25 @@ class VLATrainer(TrainerUtils):
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
-            if self.completed_steps >= self.config.trainer.max_train_steps:
-                break
+        if max_train_epochs is not None:
+            task_mode = str(getattr(self.config.trainer, "task_mode", "robot_policy"))
+            if task_mode != "human_geometry_pretrain":
+                raise ValueError("max_train_epochs is currently supported only for human_geometry_pretrain")
+            for epoch_index in range(int(max_train_epochs)):
+                if hasattr(self.vla_train_dataloader, "set_epoch"):
+                    self.vla_train_dataloader.set_epoch(epoch_index)
+                batch_iterator = iter(self.vla_train_dataloader)
+                while True:
+                    t_start_data = time.perf_counter()
+                    try:
+                        batch_vla = next(batch_iterator)
+                    except StopIteration:
+                        break
+                    train_batch(batch_vla, t_start_data)
+        else:
+            while self.completed_steps < self.config.trainer.max_train_steps:
+                t_start_data = time.perf_counter()
+                train_batch(self._get_next_batch(), t_start_data)
 
         self._finalize_training()
 
@@ -498,6 +516,32 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    max_train_epochs = cfg.trainer.get("max_train_epochs", None)
+    if max_train_epochs is not None:
+        if accelerator.num_processes != 1:
+            raise ValueError(
+                "Exact human-data epoch exposure requires a single training process; "
+                "launch with one visible GPU and without multi-process accelerate launch."
+            )
+        max_train_epochs = int(max_train_epochs)
+        if max_train_epochs < 1:
+            raise ValueError(f"trainer.max_train_epochs must be positive, got {max_train_epochs}")
+        if len(vla_train_dataloader) == 0:
+            raise ValueError("Cannot run epoch-based training with an empty dataloader")
+        accumulation_steps = int(cfg.trainer.gradient_accumulation_steps)
+        if accumulation_steps < 1:
+            raise ValueError(f"gradient_accumulation_steps must be positive, got {accumulation_steps}")
+        batches_per_epoch = len(vla_train_dataloader)
+        optimizer_steps_per_epoch = math.ceil(batches_per_epoch / accumulation_steps)
+        cfg.trainer.max_train_steps = optimizer_steps_per_epoch * max_train_epochs
+        logger.info(
+            "Epoch schedule: epochs=%d, samples=%d, batches/epoch=%d, optimizer_steps/epoch=%d, total_steps=%d",
+            max_train_epochs,
+            len(vla_train_dataloader.dataset),
+            batches_per_epoch,
+            optimizer_steps_per_epoch,
+            cfg.trainer.max_train_steps,
+        )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

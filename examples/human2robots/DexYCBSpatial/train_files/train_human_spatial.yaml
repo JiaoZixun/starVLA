@@ -1,4 +1,4 @@
-run_id: qwen35_0p8b_dexycb_h100_geometry_pretrain
+run_id: qwen35_0p8b_dexycb_h500_geometry_e50
 run_root_dir: playground/Checkpoints
 seed: 42
 is_debug: false
@@ -30,11 +30,12 @@ framework:
 datasets:
   vla_data:
     dataset_py: human_wrist_dataset
-    data_root_dir: playground/Datasets/DEXYCB
+    data_root_dir: /home/data/DexYCB_data
     geometry_sidecar_root: playground/DerivedData/dexycb_spatial_v1
-    sequence_manifest: splits/h100.jsonl
+    sequence_manifest: h500/samples.jsonl
     waypoint_tau: [1, 2, 4, 8]
     per_device_batch_size: 32
+    drop_last: false
     num_workers: 8
     pin_memory: true
     persistent_workers: true
@@ -43,9 +44,10 @@ datasets:
 
 trainer:
   task_mode: human_geometry_pretrain
-  max_train_steps: 5000
+  max_train_epochs: 50
+  max_train_steps: null  # Resolved as ceil(len(dataloader) / gradient_accumulation_steps) * max_train_epochs.
   num_warmup_steps: 500
-  save_interval: 1000
+  save_interval: 992  # H500: ceil(31719 / 32) = 992 batches per epoch.
   eval_interval: 0
   learning_rate:
     base: 5.0e-5

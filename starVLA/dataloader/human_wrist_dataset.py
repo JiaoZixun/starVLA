@@ -44,15 +44,18 @@ class HumanWristGeometryDataset(Dataset):
             if array.shape != (len(self.records), *shape_tail) or array.dtype != dtype:
                 raise ValueError(f"Invalid {name}: shape={array.shape}, dtype={array.dtype}; expected {(len(self.records), *shape_tail)}, {dtype}")
             self.arrays[name] = array
-        for index in range(len(self.records)):
-            if not np.isfinite(self.arrays["current_pose"][index]).all() or not np.isfinite(self.arrays["relative_waypoints"][index]).all():
-                raise ValueError(f"Non-finite geometry at human sample {index}")
-            side = self.arrays["effector_type"][index]
-            if np.any((side < 0) | (side > 2)):
-                raise ValueError(f"effector_type must use 0=empty, 1=left, 2=right at sample {index}")
-            invalid_slots = side == 0
-            if np.any(self.arrays["position_valid"][index][invalid_slots]) or np.any(self.arrays["rotation_valid"][index][invalid_slots]):
-                raise ValueError(f"Empty effector slots cannot carry geometry labels at sample {index}")
+        if not np.isfinite(self.arrays["current_pose"]).all():
+            raise ValueError("current_pose contains non-finite values")
+        if not np.isfinite(self.arrays["relative_waypoints"]).all():
+            raise ValueError("relative_waypoints contains non-finite values")
+        side = self.arrays["effector_type"]
+        if np.any((side < 0) | (side > 2)):
+            raise ValueError("effector_type must use 0=empty, 1=left, 2=right")
+        invalid_slots = side == 0
+        if np.any(self.arrays["position_valid"] & invalid_slots[..., None]) or np.any(
+            self.arrays["rotation_valid"] & invalid_slots[..., None]
+        ):
+            raise ValueError("Empty effector slots cannot carry geometry labels")
 
     def __len__(self):
         return len(self.records)

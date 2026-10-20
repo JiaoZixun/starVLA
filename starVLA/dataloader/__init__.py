@@ -53,6 +53,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             "num_workers": workers,
             "pin_memory": bool(data_cfg.get("pin_memory", True)),
             "shuffle": True,
+            "drop_last": bool(data_cfg.get("drop_last", False)),
         }
         if workers:
             kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
