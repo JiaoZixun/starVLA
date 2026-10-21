@@ -112,6 +112,59 @@ Finally, each result will also save a video for visualization, as shown below:
 
 ---
 
+## 🧪 LIBERO-PRO zero-shot evaluation
+
+`eval_files/eval_libero_pro.sh` evaluates LIBERO-trained checkpoints on four
+LIBERO-PRO generalization dimensions. Each dimension uses the BDDL and init files
+shipped in `playground/LIBERO-PRO` (10 tasks per suite). The default run is
+50 episodes per task, which gives 4 suites x 4 dimensions x 500 = 8,000 episodes per model.
+
+| Paper dimension | `PERTURBATIONS_CSV` value | Suite | Instruction given to the policy |
+|---|---|---|---|
+| Object | `object` | `<suite>_object` | base instruction (verified unchanged) |
+| Position | `swap` | `<suite>_swap` | base instruction (verified unchanged) |
+| Semantic | `language` | `<suite>_lan` | perturbed BDDL `(:language ...)` |
+| Task | `task` | `<suite>_task` | perturbed BDDL `(:language ...)` |
+
+The LIBERO registry derives `task.language` from the BDDL filename. For Semantic and Task
+it would therefore drop the perturbation, so those two read the instruction from
+the BDDL. The Environment dimension (scene replacement) is not included.
+
+The episode loop matches `eval_libero.py`: same seed, init states, horizons,
+preprocessing and `memory_state`/`record_executed_action` bookkeeping. Each
+(suite, dimension) pair runs as one worker covering all 10 tasks. Every env is
+seeded per task, so results do not depend on how many workers run in parallel.
+
+```bash
+# MODEL_SELECTION: baseline | spatial | mem | all | comma list
+MODEL_SELECTION=all GPU_ID=1 bash examples/simBenchmarks/LIBERO/eval_files/eval_libero_pro.sh
+# Validate GPU, NVIDIA EGL, PRO data and checkpoints without evaluating:
+MODEL_SELECTION=all GPU_ID=1 PREFLIGHT_ONLY=1 bash examples/simBenchmarks/LIBERO/eval_files/eval_libero_pro.sh
+```
+
+| Model | Default checkpoint | Required framework |
+|---|---|---|
+| `baseline` | `qwen35_0p8b_oft_libero_50k` step 50k | `QwenOFT` |
+| `spatial` | `qwen35_0p8b_spatial_oft_libero_50k` step 50k | `QwenSpatialOFT` |
+| `mem` | `qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k` step 50k | `QwenSpatialMemOFT` |
+
+Override paths with `BASELINE_CKPT`, `SPATIAL_CKPT`, `MEM_CKPT`. The launcher
+rejects a checkpoint whose framework does not match the requested ablation. For
+Spatial frameworks it reads the adapter layout from the weights. The Spatial 50k
+config has no `adapter_version`, while the code default is `v2`, so the launcher
+passes `--config_override framework.spatial.adapter_version=v1` to the server.
+The server then loads strictly, so any remaining key mismatch stops the run.
+
+Rendering follows the LIBERO rule: `MUJOCO_GL=egl`, `PYOPENGL_PLATFORM=egl`,
+`__EGL_VENDOR_LIBRARY_FILENAMES` set to the NVIDIA GLVND JSON, and
+`MUJOCO_EGL_DEVICE_ID=$GPU_ID`. The launcher checks the GPU with `nvidia-smi`
+and the renderer with `check_nvidia_egl.py` before starting. Results go to
+`results/libero_pro/<RUN_ID>/<model>/<suite>/<dimension>/summary.json`, and the
+per-model table goes to `<model>/summary.json`. `MAX_TASKS`, `NUM_TRIALS_PER_TASK`
+and `MAX_STEPS` exist only for smoke tests.
+
+---
+
 
 # 🚀 LIBERO Training
 
