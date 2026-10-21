@@ -154,10 +154,10 @@ class PolicyServerWrapper:
         }
         if base["memory_enabled"]:
             base["memory_contract"] = {
-                "recent_records": int(self._framework.memory_recent_records),
-                "decision_stride_env_steps": int(self._framework.memory_decision_stride),
+                "capacity_events": int(self._framework.memory_config.capacity_events),
+                "decision_stride_env_steps": int(self._framework.memory_config.action_horizon),
                 "visual_views": 2,
-                "visual_grid_size": 8,
+                "visual_grid_size": int(self._framework.memory_config.visual_pool_grid[0]),
                 "visual_feature_dim": 3,
             }
         # Enrich with per-embodiment keys when a default processor already exists.
@@ -196,11 +196,30 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
-        out = self._framework.predict_action(examples=examples, **kwargs)
+        policy_episode_id = kwargs.pop("policy_episode_id", None)
+        policy_env_step = kwargs.pop("policy_env_step", None)
+        executed_actions = kwargs.pop("executed_actions", None)
+        if policy_episode_id is not None or policy_env_step is not None:
+            predict_step = getattr(self._framework, "predict_policy_step", None)
+            if predict_step is None:
+                raise ValueError("This checkpoint framework does not implement stateful policy inference")
+            if len(examples) != 1:
+                raise ValueError("Stateful policy inference accepts exactly one episode at a time")
+            if executed_actions is not None:
+                executed_actions = proc.apply_actions(np.asarray(executed_actions, dtype=np.float32))
+            normalized = predict_step(
+                example=examples[0],
+                episode_id=str(policy_episode_id),
+                env_step=int(policy_env_step),
+                executed_actions=executed_actions,
+            )
+            out = {"normalized_actions": np.asarray(normalized)[None]}
+        else:
+            out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
-        unnorm = np.stack(
-            [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
-            axis=0,
-        )
-        return {"actions": unnorm}
+        unnorm = np.stack([proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])], axis=0)
+        response = {"actions": unnorm}
+        if policy_episode_id is not None and policy_env_step is not None:
+            response["normalized_actions"] = normalized
+        return response

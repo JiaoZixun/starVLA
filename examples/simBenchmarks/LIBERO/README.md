@@ -142,3 +142,39 @@ Please run the following command to start training:
 bash examples/simBenchmarks/LIBERO/train_files/run_libero_train.sh
 ```
 ⚠️ **Note:** Please ensure that you specify the correct path in `examples/simBenchmarks/LIBERO/train_files/run_libero_train.sh`
+
+### Qwen3.5 Spatial-Mem v2
+
+The memv2 training configs use derived sidecars under
+`playground/DerivedData/libero_spatial_mem_v2`. Generate them after downloading
+all four LeRobot datasets:
+
+```bash
+python examples/simBenchmarks/LIBERO/train_files/prepare_memory_v2.py --no-source-hashes
+bash examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh
+```
+
+The preprocessing writes only episode/frame indexes, EEF-pose matrices and
+two-camera 4×4 RGB summaries. It keeps source Parquet files and MP4 videos in
+place. Set `PYTHON` and `GPU_ID` when using a specific environment or device.
+Stage A loads the Spatial OFT checkpoint and trains only the new memory modules
+for steps 1–5,000. Stage B resumes at step 5,000, unfreezes the full Qwen/OFT/
+spatial/memory model and trains through total step 50,000 (45,000 more updates).
+Both stages use batch size 32. `STAGE=a` and `STAGE=b` run the stages separately.
+Before Stage B, the launcher checks for at least 33,000 MiB of free GPU memory;
+the full-unfreeze batch peaks near 30 GiB and needs room for CUDA/Triton workspaces.
+The v2 configs use a separate `qwen35_0p8b_spatial_mem_oft_v2_libero_50k`
+run directory so existing v1 checkpoints remain intact. After training, start
+standard LIBERO evaluation with
+`examples/simBenchmarks/LIBERO/eval_files/run_qwen35_0p8b_spatial_mem_oft_after_training.sh`.
+
+Each memory item is one completed 8-step interval. It contains the start/end
+4×4 RGB summaries, the eight environment actions actually associated with the
+interval, start/end proprioception, and episode-relative start/end EEF poses.
+Training builds these intervals from the same stride-aligned LeRobot rows used
+for the action targets. Evaluation closes an interval only after LIBERO accepts
+its eight actions. A shared event validator enforces the shape, stride and
+causal boundary. The event encoder compresses each interval into learned tokens;
+a causal reader exposes only completed past intervals to action and waypoint
+queries. Zero-initialized residual heads preserve the Spatial OFT behavior at
+the start of memv2 training.

@@ -1,4 +1,4 @@
-run_id: qwen35_0p8b_spatial_mem_oft_libero_50k
+run_id: qwen35_0p8b_spatial_mem_oft_v2_libero_50k
 run_root_dir: playground/Checkpoints
 seed: 42
 is_debug: false
@@ -34,13 +34,13 @@ framework:
     width: 256
     heads: 4
     ffn_width: 1024
-    layers: 2
-    recent_records: 32
-    decision_stride_env_steps: 8
-    visual_views: 2
-    visual_tokens: 8
-    visual_feature_dim: 3
-    bptt_records: 8
+    event_encoder_layers: 1
+    reader_layers: 2
+    event_tokens: 8
+    summary_tokens: 1
+    capacity_events: 128
+    visual_pool_grid: [4, 4]
+    dropout: 0.0
 
 datasets:
   vla_data:
@@ -48,12 +48,10 @@ datasets:
     data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
     data_mix: libero_spatial_mem_oft_all
     geometry_sidecar_root: playground/DerivedData/libero_spatial_oft_v1
-    memory_sidecar_root: playground/DerivedData/libero_mem_oft_v1
+    memory_sidecar_root: playground/DerivedData/libero_spatial_mem_v2
     waypoint_tau: [1, 4, 8, 16]
-    memory_recent_records: 32
     memory_decision_stride_env_steps: 8
-    memory_visual_tokens: 8
-    memory_bptt_records: 8
+    memory_capacity_events: 128
     memory_decision_frame_only: true
     drop_incomplete_action_chunks: true
     per_device_batch_size: 32
@@ -75,10 +73,13 @@ trainer:
     action_model: 1.0e-4
     waypoint_model: 5.0e-5
     spatial_adapter: 2.0e-5
-    execution_memory: 5.0e-5
+    event_encoder: 5.0e-5
+    memory_reader: 5.0e-5
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-6
+  # Stage A supplies steps 1-5k. Resume here at step 5k and fine-tune every
+  # module through total step 50k (45k additional updates), at batch 32.
   freeze_modules: ""
   is_resume: true
   pretrained_checkpoint: null

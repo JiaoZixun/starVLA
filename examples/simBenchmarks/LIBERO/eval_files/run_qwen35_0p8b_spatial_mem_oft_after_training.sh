@@ -16,7 +16,7 @@
 set -euo pipefail
 
 REPO="${STARVLA_DIR:-/data1/jiaozx/starVLA}"
-RUN_ID="qwen35_0p8b_spatial_mem_oft_libero_50k"
+RUN_ID="qwen35_0p8b_spatial_mem_oft_v2_libero_50k"
 RUN_DIR="${REPO}/playground/Checkpoints/${RUN_ID}"
 LOG_DIR="${RUN_DIR}/logs"
 STATUS_FILE="${LOG_DIR}/posttrain_eval_queue.status"

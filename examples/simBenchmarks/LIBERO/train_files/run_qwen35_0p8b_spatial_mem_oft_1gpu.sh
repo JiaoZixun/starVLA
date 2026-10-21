@@ -2,7 +2,8 @@
 # Single-GPU training for Qwen3.5-0.8B Spatial-Mem OFT on LIBERO.
 #
 # Stage A: 5 000 steps, memory modules only, loads spatial checkpoint.
-# Stage B: 50 000 steps, all modules, resumes from Stage A checkpoint.
+# Stage B: resume at step 5 000 and jointly train all modules through step 50 000
+#          (45 000 additional steps).
 # Global batch size = per_device_batch_size = 32 (single GPU).
 #
 # Usage:
@@ -20,7 +21,7 @@ STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 PYTHON="${PYTHON:-$(command -v python || true)}"
 GPU_ID="${GPU_ID:-0}"
 STAGE="${STAGE:-all}"
-RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_libero_50k"
+RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_libero_50k"
 STAGE_A_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_a.yaml"
 STAGE_B_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_b.yaml"
 QWEN35_REVISION="${QWEN35_REVISION:-2fc06364715b967f1860aea9cf38778875588b17}"
@@ -40,6 +41,15 @@ case "${STAGE}" in
   a|b|all) ;;
   *) fail "STAGE must be a, b, or all." ;;
 esac
+
+# A measured full-unfreeze batch of 32 peaks near 30.3 GiB with AdamW state.
+# Leave headroom for CUDA/Triton workspaces and reject GPUs shared with eval.
+if [[ "${STAGE}" != a ]]; then
+    FREE_GPU_MEMORY_MB="$(nvidia-smi -i "${GPU_ID}" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d '[:space:]')"
+    [[ "${FREE_GPU_MEMORY_MB}" =~ ^[0-9]+$ ]] || fail "Could not read free memory for GPU ${GPU_ID}."
+    (( FREE_GPU_MEMORY_MB >= 33000 )) || \
+        fail "Full batch=32 requires at least 33,000 MiB free; GPU ${GPU_ID} has ${FREE_GPU_MEMORY_MB} MiB. Stop other GPU jobs or select an idle GPU."
+fi
 
 cd "${STARVLA_DIR}"
 [[ -d starVLA ]] || fail "STARVLA_DIR is not the repository root: ${STARVLA_DIR}"
@@ -120,10 +130,10 @@ for dataset in \
   libero_object_no_noops_1.0.0_lerobot \
   libero_goal_no_noops_1.0.0_lerobot \
   libero_10_no_noops_1.0.0_lerobot; do
-    memory_sidecar="playground/DerivedData/libero_mem_oft_v1/${dataset}"
+    memory_sidecar="playground/DerivedData/libero_spatial_mem_v2/${dataset}"
     spatial_sidecar="playground/DerivedData/libero_spatial_oft_v1/${dataset}"
-    [[ -s "${memory_sidecar}/manifest.json" && -s "${memory_sidecar}/visual_patches.npy" ]] || \
-        fail "Memory sidecar missing for ${dataset}. Run: ${PYTHON} ${STAGE_A_CONFIG%train_files/*}train_files/prepare_memory_sidecars.py"
+    [[ -s "${memory_sidecar}/manifest.json" && -s "${memory_sidecar}/obs_rgb_tokens.npy" ]] || \
+        fail "memv2 sidecar missing for ${dataset}. Run: ${PYTHON} examples/simBenchmarks/LIBERO/train_files/prepare_memory_v2.py --datasets ${dataset} --no-source-hashes"
     [[ -s "${spatial_sidecar}/manifest.json" && -s "${spatial_sidecar}/obs_eef_pose.npy" ]] || \
         fail "Spatial pose sidecar missing for ${dataset}."
 done
@@ -156,7 +166,7 @@ if [[ "${STAGE}" == b || "${STAGE}" == all ]]; then
     [[ -s "${RUN_DIR}/checkpoints/steps_5000_pytorch_model.pt" || \
        -s "${RUN_DIR}/checkpoints/steps_5000_model.safetensors" ]] || \
         fail "Stage B requires the 5 000-step warmup checkpoint at ${RUN_DIR}/checkpoints."
-    echo "=== Starting Stage B — full training (50 000 steps, all modules) on GPU ${GPU_ID} ==="
+    echo "=== Starting Stage B — full training (steps 5 001–50 000; 45 000 updates) on GPU ${GPU_ID} ==="
     run_train "${STAGE_B_CONFIG}"
 fi
 

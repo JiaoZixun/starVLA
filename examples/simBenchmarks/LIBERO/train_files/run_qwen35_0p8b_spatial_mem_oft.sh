@@ -5,7 +5,7 @@ STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../../.." && pwd)}"
 PYTHON="${PYTHON:-$(command -v python || true)}"
 GPU_ID="${GPU_ID:-0}"
 STAGE="${STAGE:-all}"
-RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_libero_50k"
+RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_libero_50k"
 STAGE_A_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_a.yaml"
 STAGE_B_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_b.yaml"
 
@@ -60,10 +60,10 @@ for dataset in \
   libero_object_no_noops_1.0.0_lerobot \
   libero_goal_no_noops_1.0.0_lerobot \
   libero_10_no_noops_1.0.0_lerobot; do
-  memory_sidecar="playground/DerivedData/libero_mem_oft_v1/${dataset}"
+  memory_sidecar="playground/DerivedData/libero_spatial_mem_v2/${dataset}"
   spatial_sidecar="playground/DerivedData/libero_spatial_oft_v1/${dataset}"
-  [[ -s "${memory_sidecar}/manifest.json" && -s "${memory_sidecar}/visual_patches.npy" ]] || \
-    fail "Memory sidecar missing for ${dataset}. Create them with ${PYTHON} examples/simBenchmarks/LIBERO/train_files/prepare_memory_sidecars.py"
+  [[ -s "${memory_sidecar}/manifest.json" && -s "${memory_sidecar}/obs_rgb_tokens.npy" ]] || \
+    fail "memv2 sidecar missing for ${dataset}. Create it with ${PYTHON} examples/simBenchmarks/LIBERO/train_files/prepare_memory_v2.py --datasets ${dataset} --no-source-hashes"
   [[ -s "${spatial_sidecar}/manifest.json" && -s "${spatial_sidecar}/obs_eef_pose.npy" ]] || \
     fail "Spatial pose sidecar missing for ${dataset}. Run prepare_spatial_sidecars.py first."
 done

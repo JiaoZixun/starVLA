@@ -16,6 +16,7 @@ ensembling, gripper sticky logic, and chunk-cache scheduling.
 
 import os
 import time
+import uuid
 from collections import deque
 from typing import Optional, Sequence
 
@@ -25,7 +26,7 @@ from PIL import Image
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from examples.simBenchmarks.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
-from starVLA.dataloader.libero_memory import LiberoMemoryBuffer
+from starVLA.dataloader.memory_v2 import LiberoExecutionEventBuffer, MEMORY_CAPACITY_EVENTS, MEMORY_STRIDE
 
 
 def resize_image_like_training(image: np.ndarray, target_hw: Sequence[int]) -> np.ndarray:
@@ -63,17 +64,16 @@ class ModelClient:
         self.memory_enabled = bool(meta.get("memory_enabled", False))
         memory_contract = meta.get("memory_contract", {})
         self.memory_buffer = (
-            LiberoMemoryBuffer(
-                recent_records=int(memory_contract.get("recent_records", 32)),
-                decision_stride=int(memory_contract.get("decision_stride_env_steps", self.action_chunk_size)),
+            LiberoExecutionEventBuffer(
+                capacity=int(memory_contract.get("capacity_events", MEMORY_CAPACITY_EVENTS))
             )
             if self.memory_enabled
             else None
         )
-        if self.memory_enabled and self.memory_buffer.decision_stride != self.action_chunk_size:
+        if self.memory_enabled and self.action_chunk_size != MEMORY_STRIDE:
             raise ValueError(
-                "LIBERO memory decision_stride_env_steps must equal action_chunk_size; "
-                f"got {self.memory_buffer.decision_stride} and {self.action_chunk_size}"
+                "LIBERO memory event stride must equal action_chunk_size; "
+                f"expected {MEMORY_STRIDE}, got {self.action_chunk_size}"
             )
 
         # This adapter implements the 7D LIBERO action contract and the
@@ -137,6 +137,7 @@ class ModelClient:
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
+        self.policy_episode_id = uuid.uuid4().hex
 
         self.task_description = None
         self.image_history = deque(maxlen=self.horizon)
@@ -156,8 +157,6 @@ class ModelClient:
         self.inference_timing_by_task: dict[int, list[float]] = {}
         self.inference_timing_task_descriptions: dict[int, str] = {}
         self._timing_task_id: Optional[int] = None
-        self._pending_memory_example: Optional[dict] = None
-        self._pending_memory_step: Optional[int] = None
 
     def set_timing_task_context(self, task_id: int, task_description: str) -> None:
         """Set the task label used by optional per-request inference timing."""
@@ -217,8 +216,7 @@ class ModelClient:
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
         self.raw_actions = None
-        self._pending_memory_example = None
-        self._pending_memory_step = None
+        self.policy_episode_id = uuid.uuid4().hex
         if self.memory_buffer is not None:
             self.memory_buffer.reset()
 
@@ -240,7 +238,6 @@ class ModelClient:
         # with PIL's default bicubic filter. Using bilinear here was a silent
         # train/eval visual-domain shift that affected both the released 4B
         # checkpoint and the currently trained 0.8B checkpoint.
-        memory_source_images = example.get("image")
         if self.image_size and example.get("image"):
             target_hw = self.image_size  # (H, W)
             resized = [resize_image_like_training(img, target_hw) for img in example["image"]]
@@ -249,17 +246,16 @@ class ModelClient:
         # Refresh chunk if needed.
         if step % self.action_chunk_size == 0 or self.raw_actions is None:
             if self.memory_buffer is not None:
-                # Training rebuilds the long-term slots from the stride-aligned
-                # prefix that precedes the recent window; eval must feed the
-                # same prefix or the slots start from the seed every episode.
+                events = self.memory_buffer.begin_query(example, int(step))
                 example = {
                     **example,
-                    "memory_records": self.memory_buffer.build(step),
-                    "memory_burnin_records": self.memory_buffer.build_burnin(step),
+                    "memory_events": events,
+                    "memory_episode_id": self.policy_episode_id,
+                    "env_step": int(step),
                     "memory_contract": {
                         "history_is_strictly_past": True,
-                        "decision_stride_env_steps": self.memory_buffer.decision_stride,
-                        "recent_records": self.memory_buffer.recent_records,
+                        "decision_stride_env_steps": MEMORY_STRIDE,
+                        "capacity_events": self.memory_buffer.history.capacity,
                         "source_frame_index": int(step),
                     },
                 }
@@ -307,13 +303,6 @@ class ModelClient:
             if not np.isfinite(actions_batch).all():
                 raise ValueError("Policy server returned non-finite actions")
             self.raw_actions = actions_batch[0]  # (T, D)
-            if self.memory_buffer is not None:
-                memory_example = {**example, "image": memory_source_images}
-                # Do not write a prediction into execution history.  The
-                # caller commits the controller-normalized action only after
-                # env.step has actually accepted it.
-                self._pending_memory_example = memory_example
-                self._pending_memory_step = int(step)
 
         chunk_index = step % self.action_chunk_size
         raw_actions = self.raw_actions[chunk_index][None]
@@ -325,16 +314,10 @@ class ModelClient:
         return {"raw_action": raw_action}
 
     def record_executed_action(self, executed_action: np.ndarray, step: int) -> None:
-        """Commit the action actually sent to LIBERO after ``env.step``."""
+        """Commit the exact command accepted by LIBERO after ``env.step``."""
         if self.memory_buffer is None:
             return
-        if self._pending_memory_example is None and int(step) % self.action_chunk_size != 0:
-            return
-        if self._pending_memory_example is None or self._pending_memory_step != int(step):
-            raise RuntimeError(f"No pending policy decision for executed step {step}")
-        self.memory_buffer.append(self._pending_memory_example, np.asarray(executed_action, dtype=np.float32), int(step))
-        self._pending_memory_example = None
-        self._pending_memory_step = None
+        self.memory_buffer.record_executed_action(executed_action, int(step))
 
     def visualize_epoch(
         self, predicted_raw_actions: Sequence[np.ndarray], images: Sequence[np.ndarray], save_path: str

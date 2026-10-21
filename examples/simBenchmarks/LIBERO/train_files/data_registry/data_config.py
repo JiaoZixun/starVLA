@@ -5,7 +5,7 @@ from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTran
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 from starVLA.dataloader.geometry_lerobot_dataset import SpatialLeRobotSingleDataset
-from starVLA.dataloader.memory_lerobot_dataset import MemoryLeRobotSingleDataset
+from starVLA.dataloader.execution_event_lerobot_dataset import ExecutionEventLeRobotDataset
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ class SpatialLibero4in1DataConfig(Libero4in1DataConfig):
 
 
 class MemoryLibero4in1DataConfig(SpatialLibero4in1DataConfig):
-    """Spatial LIBERO config with an external, strictly causal memory sidecar."""
+    """Spatial LIBERO config with stride-8 causal execution-event history."""
 
     def make_dataset(self, **kwargs):
         data_cfg = kwargs.get("data_cfg")
@@ -126,16 +126,13 @@ class MemoryLibero4in1DataConfig(SpatialLibero4in1DataConfig):
         memory_root = data_cfg.get("memory_sidecar_root")
         if not geometry_root or not memory_root:
             raise ValueError("Memory LIBERO training requires both geometry and memory sidecar roots")
-        return MemoryLeRobotSingleDataset(
+        return ExecutionEventLeRobotDataset(
             **kwargs,
             geometry_sidecar_root=geometry_root,
             memory_sidecar_root=memory_root,
             waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 4, 8, 16])),
-            memory_recent_records=int(data_cfg.get("memory_recent_records", 32)),
-            memory_decision_stride=int(data_cfg.get("memory_decision_stride_env_steps", 8)),
-            memory_visual_tokens=int(data_cfg.get("memory_visual_tokens", 8)),
-            memory_bptt_records=int(data_cfg.get("memory_bptt_records", 8)),
-            memory_dropout=float(data_cfg.get("memory_dropout", 0.0)),
+            memory_capacity_events=int(data_cfg.get("memory_capacity_events", 128)),
+            memory_decision_stride_env_steps=int(data_cfg.get("memory_decision_stride_env_steps", 8)),
         )
 
 

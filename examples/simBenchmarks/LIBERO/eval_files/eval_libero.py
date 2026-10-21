@@ -202,7 +202,7 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
-                    "memory_state": state.astype(np.float32),
+                    "state": state.astype(np.float32)[None, :],
                     # Current measured TCP pose is available at inference; future labels stay training-only.
                     "geometry_current": {
                         "eef_pose": pose_from_position_axis_angle(state[:3], state[3:6]),
@@ -243,14 +243,9 @@ def eval_libero(args: Args) -> None:
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
                 obs, reward, done, info = env.step(delta_action.tolist())
-                # A memory record represents the first action of a newly
-                # requested chunk.  The remaining actions are already queued
-                # and must not be appended as separate execution records.
-                if (
-                    hasattr(client_model, "record_executed_action")
-                    and step % client_model.action_chunk_size == 0
-                ):
-                    client_model.record_executed_action(delta_action, step)
+                # Capture every actual control after the simulator accepted it;
+                # the next 8-step decision closes this execution event.
+                client_model.record_executed_action(delta_action, step)
                 if done:
                     task_successes += 1
                     total_successes += 1

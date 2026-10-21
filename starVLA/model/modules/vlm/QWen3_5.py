@@ -176,6 +176,93 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         return outputs
 
+    def forward_features(self, *, pool_grid: tuple[int, int] = (4, 4), **kwargs):
+        """Return final text features without materializing all hidden states or logits.
+
+        Spatial OFT regresses actions from action-token features. Calling the
+        multimodal base model directly avoids the language-model head and the
+        tuple of every layer's hidden states, which otherwise costs memory and
+        time for a large batch. The vision tower runs once and supplies both
+        the language sequence and compact pooled image features.
+        """
+        pixel_values = kwargs.pop("pixel_values", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        input_ids = kwargs.pop("input_ids", None)
+        if pixel_values is None or image_grid_thw is None or input_ids is None:
+            raise ValueError("Qwen3.5 forward_features requires pixel_values, image_grid_thw and input_ids")
+
+        base_model = self.model.model
+        image_outputs = base_model.get_image_features(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            return_dict=True,
+        )
+        per_image_features = image_outputs.pooler_output
+        if not isinstance(per_image_features, (tuple, list)):
+            raise TypeError("Qwen3.5 image pooler_output must retain one tensor per image")
+
+        inputs_embeds = base_model.get_input_embeddings()(input_ids)
+        image_embeds = torch.cat(per_image_features, dim=0).to(
+            device=inputs_embeds.device, dtype=inputs_embeds.dtype
+        )
+        image_mask, _ = base_model.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        attention_mask = kwargs.pop("attention_mask", None)
+        position_ids = kwargs.pop("position_ids", None)
+        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+        cache_position = kwargs.pop("cache_position", None)
+        kwargs.pop("use_cache", None)
+        kwargs.pop("output_hidden_states", None)
+        kwargs.pop("output_attentions", None)
+        kwargs.pop("return_dict", None)
+        kwargs.pop("pixel_values_videos", None)
+        kwargs.pop("video_grid_thw", None)
+        if position_ids is None:
+            position_ids = base_model.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+        language_outputs = base_model.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            use_cache=False,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=True,
+            **kwargs,
+        )
+
+        batch_size = int(input_ids.shape[0])
+        image_count = len(per_image_features)
+        if image_count % batch_size:
+            raise ValueError(f"Image count {image_count} is not divisible by batch size {batch_size}")
+        views = image_count // batch_size
+        pooled = []
+        merge = int(base_model.visual.spatial_merge_size)
+        for features, grid in zip(per_image_features, image_grid_thw):
+            grid_height, grid_width = int(grid[1]), int(grid[2])
+            if grid_height % merge or grid_width % merge:
+                raise ValueError(f"Image grid {grid.tolist()} is not divisible by merge size {merge}")
+            height, width = grid_height // merge, grid_width // merge
+            if features.shape[0] != height * width:
+                raise ValueError(f"Image feature count disagrees with grid {grid.tolist()}")
+            feature_map = features.transpose(0, 1).reshape(1, features.shape[-1], height, width).float()
+            bins = torch.nn.functional.adaptive_avg_pool2d(feature_map, pool_grid)
+            pooled.append(bins.flatten(2).transpose(1, 2).squeeze(0).to(features.dtype))
+        visual = torch.stack(pooled, dim=0).reshape(batch_size, views, pool_grid[0] * pool_grid[1], -1)
+        return language_outputs.last_hidden_state, visual
+
     def generate(
         self,
         **kwargs,
