@@ -178,3 +178,22 @@ causal boundary. The event encoder compresses each interval into learned tokens;
 a causal reader exposes only completed past intervals to action and waypoint
 queries. Zero-initialized residual heads preserve the Spatial OFT behavior at
 the start of memv2 training.
+
+Train/eval contract notes:
+
+- Memory proprioception is passed as `memory_state` (8-D, raw). `state` is never
+  sent: Qwen OFT frameworks append `state` to the prompt, and the reused Spatial
+  checkpoint was trained without it. QwenSpatialMemOFT rejects `state`.
+- The Spatial 50k checkpoint predates the gripper head and spatial gate, so the
+  memv2 configs set `spatial.adapter_version: v1` and `tau: [1, 2, 4, 8]`.
+  Stage A uses `strict_reload: true`; a key mismatch stops training instead of
+  freezing randomly initialized layers.
+- Training samples every valid frame (`memory_decision_frame_only: false`). Each
+  anchor uses complete 8-step events ending at the anchor frame. Evaluation
+  always queries stride-aligned steps, with events starting at step 0.
+- `memory.history_dropout` and `memory.event_action_dropout` act only in the
+  training forward pass. Stage B re-warms the LR over `resume_warmup_steps`
+  because Stage A does not save optimizer state.
+- Both standard LIBERO and LIBERO-plus evaluators record every command accepted
+  by `env.step`. LIBERO-plus must keep `TASKS_PER_GPU=2` to reproduce the
+  baseline worker split and sensor-noise stream.

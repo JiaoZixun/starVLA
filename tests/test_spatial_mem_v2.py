@@ -70,7 +70,7 @@ def test_eval_buffer_emits_training_format_only_after_eight_accepted_actions():
     buffer = LiberoExecutionEventBuffer(capacity=2)
     observation = {
         "image": [np.zeros((224, 224, 3), dtype=np.uint8)] * 2,
-        "state": np.zeros((1, 8), dtype=np.float32),
+        "memory_state": np.zeros(8, dtype=np.float32),
         "geometry_current": {"eef_pose": np.eye(4, dtype=np.float32)},
     }
     assert buffer.begin_query(observation, 0) == []
@@ -78,7 +78,7 @@ def test_eval_buffer_emits_training_format_only_after_eight_accepted_actions():
         action = np.asarray([step, 0, 0, 0, 0, 0, -1], dtype=np.float32)
         buffer.record_executed_action(action, step)
 
-    later = {**observation, "state": np.ones((1, 8), dtype=np.float32)}
+    later = {**observation, "memory_state": np.ones(8, dtype=np.float32)}
     events = buffer.begin_query(later, 8)
     assert len(events) == 1
     assert events[0]["start_step"] == 0 and events[0]["end_step"] == 8
@@ -145,3 +145,46 @@ def test_se3_exponential_handles_identity_translation_and_rotation_with_gradient
     assert torch.allclose(half_turn[0, :3, :3], expected, atol=1e-6)
     identity.sum().backward()
     assert zero.grad is not None and torch.isfinite(zero.grad).all()
+
+
+def test_eval_buffer_rejects_prompt_state_key():
+    # ``state`` feeds the Qwen prompt; memory must not silently read it.
+    buffer = LiberoExecutionEventBuffer(capacity=2)
+    observation = {
+        "image": [np.zeros((224, 224, 3), dtype=np.uint8)] * 2,
+        "state": np.zeros((1, 8), dtype=np.float32),
+        "geometry_current": {"eef_pose": np.eye(4, dtype=np.float32)},
+    }
+    try:
+        buffer.begin_query(observation, 0)
+    except ValueError as error:
+        assert "memory_state" in str(error)
+    else:
+        raise AssertionError("buffer accepted a prompt-state observation")
+
+
+def test_event_action_mask_replaces_only_dropped_events():
+    torch.manual_seed(0)
+    config = MemoryConfig(width=16, heads=4, ffn_width=32, event_tokens=2, summary_tokens=1)
+    encoder = ExecutionEventEncoder(visual_dim=3, config=config)
+    with torch.no_grad():
+        encoder.masked_action_token.normal_()
+    args = (
+        torch.rand((2, 2, 16, 3)),
+        torch.rand((2, 2, 16, 3)),
+        torch.zeros((2, 8)),
+        torch.ones((2, 8)),
+        torch.randn((2, 8, 7)),
+        torch.eye(4).repeat(2, 1, 1),
+        torch.eye(4).repeat(2, 1, 1),
+        torch.full((2,), 8.0),
+    )
+    plain = encoder(*args)
+    masked = encoder(*args, action_dropped=torch.tensor([False, True]))
+    assert torch.allclose(plain[0], masked[0])
+    assert not torch.allclose(plain[1], masked[1])
+    # A dropped event no longer depends on its executed actions.
+    other_actions = list(args)
+    other_actions[4] = torch.randn((2, 8, 7))
+    masked_other = encoder(*other_actions, action_dropped=torch.tensor([False, True]))
+    assert torch.allclose(masked[1], masked_other[1])

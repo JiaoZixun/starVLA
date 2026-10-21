@@ -253,7 +253,10 @@ class VLATrainer(TrainerUtils):
 
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            strict_reload = bool(getattr(self.config.trainer, "strict_reload", False))
+            self.model = self.load_pretrained_backbones(
+                self.model, pretrained_checkpoint, reload_modules=reload_modules, strict_reload=strict_reload
+            )
             self.completed_steps = 0
             self.resume_from_checkpoint = pretrained_checkpoint
             logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
@@ -267,6 +270,25 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
             for _ in range(self.completed_steps):
                 self.lr_scheduler.step()
+            # Optimizer state is not checkpointed, so a resumed run starts from
+            # fresh AdamW moments.  Optionally ramp the scheduled LR back up
+            # linearly over the first N resumed steps (0 keeps old behavior).
+            rewarm = int(getattr(self.config.trainer, "resume_warmup_steps", 0) or 0)
+            if rewarm > 0:
+                if not hasattr(self.lr_scheduler, "lr_lambdas"):
+                    raise ValueError("resume_warmup_steps requires a LambdaLR-based scheduler")
+                resume_step = self.completed_steps
+
+                def _rewarm(base_lambda, start=resume_step, length=rewarm):
+                    return lambda step: base_lambda(step) * min(1.0, max(step - start + 1, 1) / length)
+
+                self.lr_scheduler.lr_lambdas = [_rewarm(fn) for fn in self.lr_scheduler.lr_lambdas]
+                for group, base_lr, fn in zip(
+                    self.optimizer.param_groups, self.lr_scheduler.base_lrs, self.lr_scheduler.lr_lambdas
+                ):
+                    group["lr"] = base_lr * fn(self.lr_scheduler.last_epoch)
+                self.lr_scheduler._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+                logger.info(f"Re-warming LR over {rewarm} steps after resume at step {resume_step}")
             logger.info(
                 f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
             )

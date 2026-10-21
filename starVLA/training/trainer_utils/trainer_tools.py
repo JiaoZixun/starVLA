@@ -250,7 +250,7 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
-    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):
+    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None, strict_reload=False):
         """
         load checkpoint:
         - if reload_modules is set, load by path part
@@ -296,14 +296,24 @@ class TrainerUtils:
                             if key in current_state and tuple(current_state[key].shape) == tuple(value.shape)
                         }
                         skipped = sorted(set(sub_state_dict) - set(compatible))
+                        missing = sorted(set(current_state) - set(compatible))
+                        if strict_reload and (skipped or missing):
+                            raise RuntimeError(
+                                f"strict_reload: module '{path}' does not match the checkpoint; "
+                                f"skipped={skipped[:8]} missing={missing[:8]}"
+                            )
                         module.load_state_dict(compatible, strict=False)
                         if _dist_rank() == 0:
                             suffix = f"; skipped {len(skipped)} incompatible keys" if skipped else ""
                             print(f"✅ parameters loaded to module '{path}' ({len(compatible)} keys){suffix}")
                         loaded_modules.append(path)
                     else:
+                        if strict_reload:
+                            raise RuntimeError(f"strict_reload: no parameters for '{path}' in {checkpoint_path}")
                         print(f"⚠️ parameters not found in checkpoint '{path}'")
                 except AttributeError:
+                    if strict_reload:
+                        raise
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:

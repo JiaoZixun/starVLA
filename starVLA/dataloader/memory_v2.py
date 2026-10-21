@@ -149,7 +149,11 @@ class LiberoExecutionEventBuffer:
 
     @staticmethod
     def _state(example: dict[str, Any]) -> np.ndarray:
-        return _array(np.asarray(example.get("state")).reshape(-1), (8,), "state")
+        # ``state`` would be appended to the Qwen prompt by QwenSpatialOFT; the
+        # memory path reads its own key so the frozen Spatial prompt is unchanged.
+        if "memory_state" not in example:
+            raise ValueError("LIBERO execution memory requires memory_state")
+        return _array(np.asarray(example["memory_state"]).reshape(-1), (8,), "memory_state")
 
     def begin_query(self, example: dict[str, Any], env_step: int) -> list[dict[str, Any]]:
         """Close the previous interval, then stage this observation for the next one."""

@@ -30,6 +30,7 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         memory_sidecar_root: str | Path,
         memory_capacity_events: int = MEMORY_CAPACITY_EVENTS,
         memory_decision_stride_env_steps: int = MEMORY_STRIDE,
+        memory_aligned_anchors_only: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -39,6 +40,12 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         if self.memory_capacity_events < 1:
             raise ValueError("memory_capacity_events must be positive")
         self.memory_decision_stride = int(memory_decision_stride_env_steps)
+        # Eval queries always fall on multiples of the stride.  With phase-shifted
+        # anchors the event grid instead ends at the anchor frame, so every
+        # event is still a complete, contiguous 8-step interval ending at or
+        # before the query; only the < stride prefix before the first event is
+        # not represented.  This gives 8x more distinct anchors.
+        self.memory_aligned_anchors_only = bool(memory_aligned_anchors_only)
         self.memory_sidecar_dir = Path(memory_sidecar_root) / self.dataset_name
         manifest_path = self.memory_sidecar_dir / "manifest.json"
         visual_path = self.memory_sidecar_dir / "obs_rgb_tokens.npy"
@@ -110,15 +117,18 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         offset, episode_length = self._memory_offsets[episode_id]
         if not 0 <= frame_index < episode_length:
             raise IndexError(f"Invalid frame {frame_index} for episode {episode_id}")
-        if frame_index % self.memory_decision_stride:
-            raise ValueError(
-                f"memv2 training anchors must align to stride {self.memory_decision_stride}; got {frame_index}"
-            )
+        stride = self.memory_decision_stride
+        phase = frame_index % stride
+        if phase and self.memory_aligned_anchors_only:
+            raise ValueError(f"memv2 training anchors must align to stride {stride}; got {frame_index}")
 
         # This is the same raw 8-D proprioception passed by the LIBERO eval client.
         states, _ = self._raw_state_actions(frame_index, frame_index + 1)
         current_state = states[0]
-        sample["state"] = current_state[None, :].astype(np.float32, copy=False)
+        # Memory-only proprioception.  ``state`` is deliberately not set: the
+        # Spatial OFT checkpoint was trained without a state prompt.
+        sample.pop("state", None)
+        sample["memory_state"] = current_state.astype(np.float32, copy=False)
         # The parent geometry dataset already owns this pose mapping; reuse it
         # rather than writing another copy into the memv2 sidecar.
         poses = self._get_geometry_pose_memmap()
@@ -128,11 +138,12 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         sample["memory_visual_tokens"] = current_visual
         sample["env_step"] = int(frame_index)
 
-        first_start = max(0, frame_index // self.memory_decision_stride - self.memory_capacity_events)
+        completed = frame_index // stride
+        first_event = max(0, completed - self.memory_capacity_events)
         events = []
-        for event_index in range(first_start, frame_index // self.memory_decision_stride):
-            start = event_index * self.memory_decision_stride
-            end = start + self.memory_decision_stride
+        for event_index in range(first_event, completed):
+            start = phase + event_index * stride
+            end = start + stride
             if end > frame_index or end > episode_length:
                 raise AssertionError("memv2 attempted to include an incomplete or current event")
             event_states, event_actions = self._raw_state_actions(start, end)
@@ -158,6 +169,7 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
             "decision_stride_env_steps": self.memory_decision_stride,
             "capacity_events": self.memory_capacity_events,
             "source_frame_index": int(frame_index),
+            "event_phase": int(phase),
             "episode_index": int(episode_id),
             "event_action_source": "raw_source_action_rows_with_eval_gripper_mapping",
             "event_interval": "[start_step,end_step), end_step <= source_frame_index",

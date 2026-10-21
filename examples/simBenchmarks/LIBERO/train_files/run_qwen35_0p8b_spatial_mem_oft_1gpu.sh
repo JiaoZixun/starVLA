@@ -53,6 +53,9 @@ fi
 
 cd "${STARVLA_DIR}"
 [[ -d starVLA ]] || fail "STARVLA_DIR is not the repository root: ${STARVLA_DIR}"
+# Post-training eval queues wait while this launcher PID is alive.
+mkdir -p "${RUN_DIR}"
+echo "$$" > "${RUN_DIR}/launcher.pid"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 # Suppress Python-level UserWarnings (torchvision deprecations, etc.) from the log.

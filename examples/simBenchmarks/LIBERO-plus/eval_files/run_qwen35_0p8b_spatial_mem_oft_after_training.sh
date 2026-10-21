@@ -17,7 +17,7 @@ set -euo pipefail
 
 REPO="${STARVLA_DIR:-/data1/jiaozx/starVLA}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_ID="qwen35_0p8b_spatial_mem_oft_libero_50k"
+RUN_ID="${MEM_RUN_ID:-qwen35_0p8b_spatial_mem_oft_v2_libero_50k}"
 RUN_DIR="${REPO}/playground/Checkpoints/${RUN_ID}"
 LOG_DIR="${RUN_DIR}/logs"
 STATUS_FILE="${LOG_DIR}/posttrain_libero_plus_queue.status"
@@ -122,7 +122,7 @@ while true; do
   sleep 30 9>&-
 done
 
-run_id="qwen35_0p8b_spatial_mem_oft_50k_libero_plus_$(date '+%Y%m%d_%H%M%S')"
+run_id="${RUN_ID}_libero_plus_$(date '+%Y%m%d_%H%M%S')"
 result_root="${REPO}/results/${run_id}"
 write_status "starting_evaluation" \
   "Training completed; launching four-suite LIBERO-plus evaluation on GPU ${EVAL_GPU_ID}."

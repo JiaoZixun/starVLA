@@ -55,6 +55,8 @@ class QwenSpatialMemOFTDefaultConfig:
             "capacity_events": 128,
             "visual_pool_grid": [4, 4],
             "dropout": 0.0,
+            "history_dropout": 0.0,
+            "event_action_dropout": 0.0,
         }
     )
 
@@ -83,7 +85,12 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             visual_pool_grid=grid,
             action_horizon=self.action_horizon,
             dropout=float(memory.get("dropout", 0.0)),
+            history_dropout=float(memory.get("history_dropout", 0.0)),
+            event_action_dropout=float(memory.get("event_action_dropout", 0.0)),
         )
+        for name in ("history_dropout", "event_action_dropout"):
+            if not 0.0 <= getattr(self.memory_config, name) < 1.0:
+                raise ValueError(f"memory.{name} must be in [0, 1)")
         width = self.memory_config.width
         hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
         self.event_encoder = ExecutionEventEncoder(VISUAL_FEATURE_DIM, self.memory_config)
@@ -110,9 +117,13 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         if image_size:
             batch_images = resize_images(batch_images, target_size=image_size)
         instructions = [example["lang"] for example in examples]
-        states = [example["state"] for example in examples] if "state" in examples[0] else None
-        if states is not None:
-            instructions = self.add_discretized_state_to_instruction(instructions, states)
+        # The reused Spatial OFT checkpoint was trained without a state prompt.
+        # Memory proprioception arrives as ``memory_state``; a stray ``state``
+        # would silently change the frozen Qwen input, so reject it.
+        if any("state" in example for example in examples):
+            raise ValueError(
+                "QwenSpatialMemOFT does not use a state prompt; pass proprioception as memory_state"
+            )
         action_tokens = self.action_token * self.chunk_len
         prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
         instructions = [instruction + prompt_suffix for instruction in instructions]
@@ -190,6 +201,11 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         encoded = torch.zeros(
             (batch, max_events, token_count, self.memory_config.width), device=device, dtype=torch.float32
         )
+        action_dropped = None
+        if missing_events and train and self.memory_config.event_action_dropout > 0:
+            action_dropped = (
+                torch.rand(len(missing_events), device=device) < self.memory_config.event_action_dropout
+            )
         if missing_events:
             encoded_missing = self.event_encoder(
                 self._tensor(np.stack([event["visual_start"] for event in missing_events]), device, torch.float32),
@@ -200,6 +216,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 self._tensor(np.stack([event["pose_start_in_episode"] for event in missing_events]), device, torch.float32),
                 self._tensor(np.stack([event["pose_end_in_episode"] for event in missing_events]), device, torch.float32),
                 self._tensor([event["elapsed_steps"] for event in missing_events], device, torch.float32),
+                action_dropped=action_dropped,
             )
             missing_index = 0
             for b, events in enumerate(event_lists):
@@ -212,7 +229,8 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                     encoded[b, index] = tokens
                     if not train and episode_ids[b] is not None:
                         episode_cache = self._eval_event_cache[str(episode_ids[b])]
-                        episode_cache[cache_key] = tokens.detach().float().cpu().numpy().astype(np.float16)
+                        # Keep fp32 so cached and freshly encoded events are identical.
+                        episode_cache[cache_key] = tokens.detach().float().cpu().numpy()
                     missing_index += 1
 
         if not train:
@@ -244,9 +262,9 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
     def _batch_states(self, examples: list[dict], device: torch.device) -> torch.Tensor:
         states = []
         for example in examples:
-            if "state" not in example:
-                raise ValueError("QwenSpatialMemOFT requires the same current 8D state in train and eval")
-            state = np.asarray(example["state"], dtype=np.float32).reshape(-1)
+            if "memory_state" not in example:
+                raise ValueError("QwenSpatialMemOFT requires the same current 8D memory_state in train and eval")
+            state = np.asarray(example["memory_state"], dtype=np.float32).reshape(-1)
             if state.shape != (8,) or not np.isfinite(state).all():
                 raise ValueError(f"Current state must be finite [8], got {state.shape}")
             states.append(state)
@@ -283,6 +301,11 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
 
             if event_lists is None:
                 event_lists = [list(example.get("memory_events", [])) for example in examples]
+            if train and self.memory_config.history_dropout > 0:
+                # Whole-history dropout falls back to the exact Spatial path
+                # (no visible events), which is also what eval sees at step 0.
+                keep = (torch.rand(batch) >= self.memory_config.history_dropout).tolist()
+                event_lists = [events if kept else [] for events, kept in zip(event_lists, keep)]
             episode_ids = [example.get("memory_episode_id") for example in examples]
             event_tokens, event_valid, event_starts, event_ends = self._encode_event_lists(
                 event_lists, device, train=train, episode_ids=episode_ids
@@ -295,8 +318,13 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 if int(contract.get("decision_stride_env_steps", -1)) != MEMORY_STRIDE:
                     raise ValueError("Memory event stride differs from the model's 8-step action horizon")
                 query_step = int(example.get("env_step", contract.get("source_frame_index", -1)))
-                if query_step < 0 or query_step % MEMORY_STRIDE:
-                    raise ValueError(f"Memory query step must be nonnegative and stride-aligned, got {query_step}")
+                # Evaluators never send event_phase (phase 0; their buffer
+                # enforces stride-aligned queries).  Training samples, including
+                # the trainer's in-loop action eval, may use phase-shifted grids
+                # that still end exactly at the query step.
+                phase = int(contract.get("event_phase", 0))
+                if query_step < 0 or not 0 <= phase < MEMORY_STRIDE or query_step % MEMORY_STRIDE != phase:
+                    raise ValueError(f"Memory query step {query_step} does not match event phase {phase}")
                 if any(int(event["start_step"]) >= query_step or int(event["end_step"]) > query_step for event in events):
                     raise ValueError(f"Sample {index} includes a current/future execution event")
                 query_steps.append(query_step)
@@ -396,7 +424,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         )
         gripper_loss = (
             torch.abs(waypoint_gripper.float() - gripper_target.float())[gripper_valid].mean()
-            if torch.any(gripper_valid)
+            if self.gripper_weight != 0.0 and torch.any(gripper_valid)
             else bc_loss.new_zeros(())
         )
         total_loss = bc_loss + self.waypoint_weight * waypoint_loss + self.gripper_weight * gripper_loss

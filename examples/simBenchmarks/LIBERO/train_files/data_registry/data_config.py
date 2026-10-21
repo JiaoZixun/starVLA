@@ -133,6 +133,9 @@ class MemoryLibero4in1DataConfig(SpatialLibero4in1DataConfig):
             waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 4, 8, 16])),
             memory_capacity_events=int(data_cfg.get("memory_capacity_events", 128)),
             memory_decision_stride_env_steps=int(data_cfg.get("memory_decision_stride_env_steps", 8)),
+            # The mixture sampler only draws stride-aligned anchors when this is
+            # true; keep the dataset-side check in sync with it.
+            memory_aligned_anchors_only=bool(data_cfg.get("memory_decision_frame_only", True)),
         )
 
 

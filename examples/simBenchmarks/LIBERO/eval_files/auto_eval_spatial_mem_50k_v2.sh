@@ -47,7 +47,7 @@ SKIP_LIBERO_STANDARD="${SKIP_LIBERO_STANDARD:-0}"
 SKIP_LIBERO_PLUS="${SKIP_LIBERO_PLUS:-0}"
 CKPT_STABLE_SECONDS="${CKPT_STABLE_SECONDS:-120}"
 
-RUN_ID="qwen35_0p8b_spatial_mem_oft_libero_50k"
+RUN_ID="${MEM_RUN_ID:-qwen35_0p8b_spatial_mem_oft_v2_libero_50k}"
 RUN_DIR="${STARVLA_DIR}/playground/Checkpoints/${RUN_ID}"
 CKPT_PATH="${RUN_DIR}/checkpoints/steps_50000_pytorch_model.pt"
 LIBERO_HOME="${LIBERO_HOME:-${STARVLA_DIR}/playground/LIBERO}"

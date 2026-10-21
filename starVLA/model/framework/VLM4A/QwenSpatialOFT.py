@@ -189,9 +189,10 @@ class CausalExecutionMemory(nn.Module):
 class WaypointModel(nn.Module):
     """Predict relative SE(3) waypoints from task-conditioned action-token features."""
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4):
+    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4, predict_gripper: bool = True):
         super().__init__()
         self.width = width
+        self.predict_gripper = bool(predict_gripper)
         self.memory_projection = nn.Linear(vlm_width, width)
         self.anchor_projection = nn.Sequential(nn.Linear(9, width), nn.GELU(), nn.Linear(width, width))
         self.arm_embedding = nn.Embedding(2, width)
@@ -200,13 +201,14 @@ class WaypointModel(nn.Module):
         self.output_norm = nn.LayerNorm(width)
         self.translation_head = nn.Linear(width, 3)
         self.rotation_head = nn.Linear(width, 6)
-        self.gripper_head = nn.Linear(width, 1)
         self.num_waypoints = num_waypoints
         nn.init.zeros_(self.translation_head.weight)
         nn.init.zeros_(self.translation_head.bias)
         nn.init.zeros_(self.rotation_head.weight)
-        nn.init.zeros_(self.gripper_head.weight)
-        nn.init.zeros_(self.gripper_head.bias)
+        if self.predict_gripper:
+            self.gripper_head = nn.Linear(width, 1)
+            nn.init.zeros_(self.gripper_head.weight)
+            nn.init.zeros_(self.gripper_head.bias)
         with torch.no_grad():
             self.rotation_head.bias.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
@@ -233,23 +235,31 @@ class WaypointModel(nn.Module):
         features = self.output_norm(query)
         translation = self.translation_head(features)
         rotation = self.rotation_head(features)
-        gripper = self.gripper_head(features).squeeze(-1)
+        if self.predict_gripper:
+            gripper = self.gripper_head(features).squeeze(-1)
+        else:
+            gripper = translation.new_zeros(translation.shape[:-1])
         return translation, rotation, gripper
 
 
 class SpatialAdapter(nn.Module):
     """Cross-attend action queries to explicit metric waypoint tokens."""
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4):
+    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4, gated: bool = True):
         super().__init__()
+        # v1 (ungated) has no gripper token channel and no spatial gate.
+        self.gated = bool(gated)
         self.action_projection = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
-        self.spatial_projection = nn.Sequential(nn.Linear(12, width), nn.GELU(), nn.Linear(width, width))
-        self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
-        self.spatial_gate = nn.Sequential(
-            nn.LayerNorm(vlm_width + width),
-            nn.Linear(vlm_width + width, width),
-            nn.Sigmoid(),
+        self.spatial_projection = nn.Sequential(
+            nn.Linear(12 if self.gated else 11, width), nn.GELU(), nn.Linear(width, width)
         )
+        self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        if self.gated:
+            self.spatial_gate = nn.Sequential(
+                nn.LayerNorm(vlm_width + width),
+                nn.Linear(vlm_width + width, width),
+                nn.Sigmoid(),
+            )
         self.output_projection = nn.Linear(width, vlm_width)
         self.num_waypoints = num_waypoints
         nn.init.zeros_(self.output_projection.weight)
@@ -267,14 +277,17 @@ class SpatialAdapter(nn.Module):
         normalized_time = tau.float().view(1, -1, 1).expand(batch_size, -1, -1)
         arm_id = torch.zeros_like(normalized_time)
         # The token includes predicted metric coordinates. It does not use future labels or decoder-only latents.
-        token_values = torch.cat(
-            (translation.float() / 0.1, rotation_6d.float(), gripper.float().unsqueeze(-1), normalized_time, arm_id),
-            dim=-1,
-        )
+        values = [translation.float() / 0.1, rotation_6d.float()]
+        if self.gated:
+            values.append(gripper.float().unsqueeze(-1))
+        token_values = torch.cat((*values, normalized_time, arm_id), dim=-1)
         queries = self.action_projection(action_features)
         keys = self.spatial_projection(token_values)
         update, _ = self.cross_attention(queries, keys, keys, need_weights=False)
-        gates = self.spatial_gate(torch.cat((action_features, update), dim=-1))
+        if self.gated:
+            gates = self.spatial_gate(torch.cat((action_features, update), dim=-1))
+        else:
+            gates = torch.ones_like(update)
         residual = self.output_projection(gates * update)
         return action_features + residual, residual, gates.detach()
 
@@ -316,11 +329,22 @@ class QwenSpatialOFT(Qwenvl_OFT):
         ffn_width = int(spatial.get("ffn_width", 1024))
         layers = int(spatial.get("layers", 2))
         hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
-        self.waypoint_model = WaypointModel(hidden_size, self.spatial_width, heads, ffn_width, layers, len(self.waypoint_tau))
-        self.spatial_adapter = SpatialAdapter(hidden_size, self.spatial_width, heads, len(self.waypoint_tau))
+        # "v1" reproduces the adapter of checkpoints trained before the gripper
+        # head / spatial gate were added (e.g. qwen35_0p8b_spatial_oft_libero_50k);
+        # "v2" is the current gated adapter.
+        self.adapter_version = str(spatial.get("adapter_version", "v2"))
+        if self.adapter_version not in ("v1", "v2"):
+            raise ValueError(f"spatial.adapter_version must be v1 or v2, got {self.adapter_version}")
+        gated = self.adapter_version == "v2"
+        self.waypoint_model = WaypointModel(
+            hidden_size, self.spatial_width, heads, ffn_width, layers, len(self.waypoint_tau), predict_gripper=gated
+        )
+        self.spatial_adapter = SpatialAdapter(hidden_size, self.spatial_width, heads, len(self.waypoint_tau), gated=gated)
         self.waypoint_weight = float(spatial.get("waypoint_weight", 1.0))
         self.waypoint_rotation_weight = float(spatial.get("waypoint_rotation_weight", 0.25))
-        self.gripper_weight = float(spatial.get("gripper_weight", 0.10))
+        self.gripper_weight = float(spatial.get("gripper_weight", 0.10 if gated else 0.0))
+        if not gated and self.gripper_weight != 0.0:
+            raise ValueError("spatial.adapter_version=v1 has no gripper head; gripper_weight must be 0")
         self.effect_weight = float(spatial.get("effect_weight", 0.0))
         self.action_geometry_weight = float(spatial.get("action_geometry_weight", 0.0))
         if self.effect_weight != 0.0:

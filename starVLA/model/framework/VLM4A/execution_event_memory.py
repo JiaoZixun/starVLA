@@ -23,6 +23,9 @@ class MemoryConfig:
     visual_pool_grid: tuple[int, int] = (4, 4)
     action_horizon: int = 8
     dropout: float = 0.0
+    # Training-only regularizers against copying the previous action chunk.
+    history_dropout: float = 0.0
+    event_action_dropout: float = 0.0
 
     @property
     def tokens_per_event(self) -> int:
@@ -61,6 +64,9 @@ class ExecutionEventEncoder(nn.Module):
         self.view_embedding = nn.Embedding(2, width)
         self.action_projection = nn.Linear(7, width)
         self.action_position = nn.Embedding(config.action_horizon, width)
+        # Replaces the executed-action context of events whose actions were
+        # dropped during training; never used at inference.
+        self.masked_action_token = nn.Parameter(torch.zeros(1, 1, width))
         self.state_projection = nn.Sequential(nn.Linear(8, width), nn.GELU(), nn.Linear(width, width))
         self.pose_projection = nn.Sequential(nn.Linear(18, width), nn.GELU(), nn.Linear(width, width))
         self.delta_pose_projection = nn.Sequential(nn.Linear(9, width), nn.GELU(), nn.Linear(width, width))
@@ -81,6 +87,7 @@ class ExecutionEventEncoder(nn.Module):
         pose_start_in_episode: torch.Tensor,
         pose_end_in_episode: torch.Tensor,
         elapsed_steps: torch.Tensor,
+        action_dropped: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, views, patches, dim = visual_start.shape
         expected_patches = self.config.visual_pool_grid[0] * self.config.visual_pool_grid[1]
@@ -100,6 +107,11 @@ class ExecutionEventEncoder(nn.Module):
 
         action_ids = torch.arange(self.config.action_horizon, device=actions.device)
         action_context = self.action_projection(actions.float()) + self.action_position(action_ids)[None]
+        if action_dropped is not None:
+            masked = self.masked_action_token + self.action_position(action_ids)[None]
+            action_context = torch.where(
+                action_dropped.view(batch, 1, 1), masked.to(action_context.dtype), action_context
+            )
 
         relative = torch.linalg.inv(pose_start_in_episode.float()) @ pose_end_in_episode.float()
         pose_features = torch.cat(

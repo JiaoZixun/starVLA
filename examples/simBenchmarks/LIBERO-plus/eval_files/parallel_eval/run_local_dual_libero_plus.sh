@@ -11,7 +11,7 @@ SPATIAL_CKPT="${SPATIAL_CKPT:-${STARVLA_DIR}/playground/Checkpoints/qwen35_0p8b_
 SPATIAL_CKPT_BYTES="${SPATIAL_CKPT_BYTES:-1761788779}"
 # Spatial + causal memory. The memory modules change the state-dict size, so the
 # expected byte count is discovered from the file itself unless pinned here.
-MEM_CKPT="${MEM_CKPT:-${STARVLA_DIR}/playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt}"
+MEM_CKPT="${MEM_CKPT:-${STARVLA_DIR}/playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_libero_50k/checkpoints/steps_50000_pytorch_model.pt}"
 MEM_CKPT_BYTES="${MEM_CKPT_BYTES:-auto}"
 HF_CACHE="${HF_HOME:-/data1/jiaozx/.cache/huggingface}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-0.8B}"

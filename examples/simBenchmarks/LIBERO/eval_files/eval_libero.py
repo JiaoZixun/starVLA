@@ -202,7 +202,9 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
-                    "state": state.astype(np.float32)[None, :],
+                    # Memory-only proprioception. Do not send ``state``: Qwen OFT
+                    # frameworks would append it to the prompt, unlike training.
+                    "memory_state": state.astype(np.float32),
                     # Current measured TCP pose is available at inference; future labels stay training-only.
                     "geometry_current": {
                         "eef_pose": pose_from_position_axis_angle(state[:3], state[3:6]),

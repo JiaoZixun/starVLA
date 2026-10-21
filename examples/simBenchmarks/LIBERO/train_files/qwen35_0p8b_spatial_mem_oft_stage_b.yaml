@@ -25,7 +25,10 @@ framework:
     heads: 4
     ffn_width: 1024
     layers: 2
-    tau: [1, 4, 8, 16]
+    # Must match the reused Spatial 50k checkpoint: it was trained with
+    # tau=[1,2,4,8] and the ungated (v1) adapter without a gripper head.
+    adapter_version: v1
+    tau: [1, 2, 4, 8]
     waypoint_weight: 1.0
     waypoint_rotation_weight: 0.25
     action_geometry_weight: 0.0
@@ -41,6 +44,10 @@ framework:
     capacity_events: 128
     visual_pool_grid: [4, 4]
     dropout: 0.0
+    # Training-only: drop the whole history (falls back to the Spatial path)
+    # or replace an event's executed actions with a learned mask token.
+    history_dropout: 0.1
+    event_action_dropout: 0.3
 
 datasets:
   vla_data:
@@ -49,10 +56,12 @@ datasets:
     data_mix: libero_spatial_mem_oft_all
     geometry_sidecar_root: playground/DerivedData/libero_spatial_oft_v1
     memory_sidecar_root: playground/DerivedData/libero_spatial_mem_v2
-    waypoint_tau: [1, 4, 8, 16]
+    waypoint_tau: [1, 2, 4, 8]
     memory_decision_stride_env_steps: 8
     memory_capacity_events: 128
-    memory_decision_frame_only: true
+    # false: sample every valid frame; the event grid is phase-shifted to end
+    # at the anchor (complete 8-step intervals only).  Eval stays stride-aligned.
+    memory_decision_frame_only: false
     drop_incomplete_action_chunks: true
     per_device_batch_size: 32
     num_workers: 8
@@ -82,6 +91,8 @@ trainer:
   # module through total step 50k (45k additional updates), at batch 32.
   freeze_modules: ""
   is_resume: true
+  # Optimizer state is not saved by Stage A; re-ramp LR over 1k resumed steps.
+  resume_warmup_steps: 1000
   pretrained_checkpoint: null
   reload_modules: null
   loss_scale:

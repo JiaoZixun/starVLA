@@ -21,7 +21,7 @@ from libero.libero.envs import OffScreenRenderEnv
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.tools import read_mode_config
 from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
-from starVLA.dataloader.libero_memory import LiberoMemoryBuffer
+from starVLA.dataloader.memory_v2 import LiberoExecutionEventBuffer, MEMORY_STRIDE
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
@@ -185,18 +185,21 @@ class PolicyModel:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        # Same causal 8-step execution-event lifecycle as the standard LIBERO
+        # client and the training dataset (starVLA.dataloader.memory_v2).
         self.memory_buffer = (
-            LiberoMemoryBuffer(
-                recent_records=int(self.vla.memory_recent_records),
-                decision_stride=int(self.vla.memory_decision_stride),
-            )
+            LiberoExecutionEventBuffer(capacity=int(self.vla.memory_config.capacity_events))
             if self.memory_enabled
             else None
         )
-        if self.memory_buffer is not None and self.memory_buffer.decision_stride != self.action_chunk_size:
-            raise ValueError("Memory decision stride must equal the LIBERO action chunk size")
-        self._pending_memory_example = None
-        self._pending_memory_step = None
+        if self.memory_buffer is not None and self.action_chunk_size != MEMORY_STRIDE:
+            raise ValueError(
+                f"Memory event stride {MEMORY_STRIDE} must equal the LIBERO action chunk size {self.action_chunk_size}"
+            )
+        # Deterministic per-episode id for the encoded-event cache; it does not
+        # draw from any RNG, so the LIBERO-plus noise stream is unchanged.
+        self._episode_counter = 0
+        self.policy_episode_id = None
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
@@ -215,8 +218,8 @@ class PolicyModel:
         self.previous_gripper_action = None
         if self.memory_buffer is not None:
             self.memory_buffer.reset()
-        self._pending_memory_example = None
-        self._pending_memory_step = None
+        self._episode_counter += 1
+        self.policy_episode_id = f"libero_plus_episode_{self._episode_counter}"
 
     def step(self, example: dict, step: int = 0, **kwargs) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
@@ -246,17 +249,18 @@ class PolicyModel:
         action_chunk_size = self.action_chunk_size
         if step % action_chunk_size == 0:
             if self.memory_buffer is not None:
-                # Training rebuilds the long-term slots from the stride-aligned
-                # prefix that precedes the recent window; eval must feed the
-                # same prefix or the slots start from the seed every episode.
+                # Memory RGB summaries are computed from the full-resolution
+                # render, matching the sidecar built from 256x256 dataset frames.
+                events = self.memory_buffer.begin_query({**example, "image": memory_source_images}, int(step))
                 example = {
                     **example,
-                    "memory_records": self.memory_buffer.build(step),
-                    "memory_burnin_records": self.memory_buffer.build_burnin(step),
+                    "memory_events": events,
+                    "memory_episode_id": self.policy_episode_id,
+                    "env_step": int(step),
                     "memory_contract": {
                         "history_is_strictly_past": True,
-                        "decision_stride_env_steps": self.memory_buffer.decision_stride,
-                        "recent_records": self.memory_buffer.recent_records,
+                        "decision_stride_env_steps": MEMORY_STRIDE,
+                        "capacity_events": self.memory_buffer.history.capacity,
                         "source_frame_index": int(step),
                     },
                 }
@@ -271,10 +275,6 @@ class PolicyModel:
             self.raw_actions = self.unnormalize_actions(
                 normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats
             )
-            if self.memory_buffer is not None:
-                memory_example = {**example, "image": memory_source_images}
-                self._pending_memory_example = memory_example
-                self._pending_memory_step = int(step)
 
         raw_actions = self.raw_actions[step % action_chunk_size][None]
 
@@ -290,13 +290,7 @@ class PolicyModel:
         """Commit the action actually accepted by the environment."""
         if self.memory_buffer is None:
             return
-        if self._pending_memory_example is None and int(step) % self.action_chunk_size != 0:
-            return
-        if self._pending_memory_example is None or self._pending_memory_step != int(step):
-            raise RuntimeError(f"No pending policy decision for executed step {step}")
-        self.memory_buffer.append(self._pending_memory_example, np.asarray(executed_action, dtype=np.float32), int(step))
-        self._pending_memory_example = None
-        self._pending_memory_step = None
+        self.memory_buffer.record_executed_action(np.asarray(executed_action, dtype=np.float32), int(step))
 
     @staticmethod
     def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
@@ -579,10 +573,9 @@ def eval_libero(args: Args) -> None:
                 # __import__("ipdb").set_trace()
                 # see ../robosuite/controllers/controller_factory.py
                 obs, reward, done, info = env.step(delta_action.tolist())
-                # Commit only the action that starts a newly requested chunk;
-                # queued chunk actions are not independent memory records.
-                if step % client_model.action_chunk_size == 0:
-                    client_model.record_executed_action(delta_action, step)
+                # Commit every command LIBERO accepted; the next 8-step query
+                # closes the execution event (no-op for memory-free models).
+                client_model.record_executed_action(delta_action, step)
                 if done:
                     task_successes += 1
                     total_successes += 1
