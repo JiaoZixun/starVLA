@@ -132,8 +132,15 @@ the BDDL. The Environment dimension (scene replacement) is not included.
 
 The episode loop matches `eval_libero.py`: same seed, init states, horizons,
 preprocessing and `memory_state`/`record_executed_action` bookkeeping. Each
-(suite, dimension) pair runs as one worker covering all 10 tasks. Every env is
-seeded per task, so results do not depend on how many workers run in parallel.
+(suite, dimension, task) runs as its own process with its own per-task env seed.
+Processes are scheduled longest horizon first (libero_10 first), with 16 running
+at a time by default (`MAX_PARALLEL_WORKERS`). The policy server uses dynamic
+batching with batch 4 (`INFERENCE_BATCH_SIZE`), the same as standard LIBERO eval.
+Batching is not bit-identical to batch 1. Measured max action difference: about
+0.02 for baseline and 0.06 for spatial. Batch membership depends on request
+timing, so reruns vary slightly. Use `INFERENCE_BATCH_SIZE=1` for per-request
+determinism; it is about 1.6x slower at 16 workers. Some PRO tasks (for example
+`libero_10_swap`) are not bit-reproducible in MuJoCo even when run in isolation.
 
 ```bash
 # MODEL_SELECTION: baseline | spatial | mem | all | comma list

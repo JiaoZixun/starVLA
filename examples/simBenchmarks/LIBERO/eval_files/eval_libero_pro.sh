@@ -7,9 +7,9 @@
 #   Semantic -> language -> <suite>_lan
 #   Task     -> task     -> <suite>_task
 #
-# One policy server per model runs on GPU_ID; each (suite, perturbation) pair
-# is one simulator worker covering all 10 tasks, so the task->worker partition
-# never depends on SIM worker counts.  Models are evaluated sequentially.
+# One policy server per model runs on GPU_ID; each (suite, perturbation, task)
+# is one simulator process with its own per-task env seed, scheduled longest
+# horizon first.  Models are evaluated sequentially.
 #
 # Environment:
 #   MODEL_SELECTION       baseline | spatial | mem | all | comma list (default: all)
@@ -19,7 +19,9 @@
 #   PERTURBATIONS_CSV     default object,swap,language,task
 #   NUM_TRIALS_PER_TASK   default 50
 #   MAX_TASKS / MAX_STEPS smoke-test caps (default -1 = full benchmark)
-#   MAX_PARALLEL_WORKERS  concurrent simulator workers per model (default 8)
+#   MAX_PARALLEL_WORKERS  concurrent simulator workers per model (default 16)
+#   INFERENCE_BATCH_SIZE  server dynamic batching (default 4, as in standard LIBERO
+#                         eval; 1 is deterministic per request but ~1.6x slower at 16 workers)
 #   RUN_ID                output dir name under results/libero_pro (default timestamp)
 #   PREFLIGHT_ONLY=1      validate GPU/EGL/checkpoints/data and exit
 set -euo pipefail
@@ -40,8 +42,8 @@ PERTURBATIONS_CSV="${PERTURBATIONS_CSV:-object,swap,language,task}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-50}"
 MAX_TASKS="${MAX_TASKS:--1}"
 MAX_STEPS="${MAX_STEPS:--1}"
-MAX_PARALLEL_WORKERS="${MAX_PARALLEL_WORKERS:-8}"
-INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-1}"
+MAX_PARALLEL_WORKERS="${MAX_PARALLEL_WORKERS:-16}"
+INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-4}"
 INFERENCE_BATCH_WAIT_MS="${INFERENCE_BATCH_WAIT_MS:-12}"
 SEED="${SEED:-7}"
 UNNORM_KEY="${UNNORM_KEY:-franka}"
@@ -74,6 +76,14 @@ done
 [[ "${MAX_PARALLEL_WORKERS}" =~ ^[1-9][0-9]*$ ]] || fail "MAX_PARALLEL_WORKERS must be a positive integer."
 [[ -x "${PYTHON}" ]] || fail "PYTHON is not executable: ${PYTHON}"
 [[ -d "${LIBERO_HOME}/libero/libero/bddl_files" ]] || fail "LIBERO-PRO tree not found: ${LIBERO_HOME}"
+
+# Longest horizon first (libero_10 > goal > object > spatial).
+ORDERED_SUITES=()
+for suite in libero_10 libero_goal libero_object libero_spatial; do
+  for selected in "${TASK_SUITES[@]}"; do
+    if [[ "${selected}" == "${suite}" ]]; then ORDERED_SUITES+=("${suite}"); fi
+  done
+done
 
 ckpt_for() {
   case "$1" in
@@ -198,32 +208,39 @@ run_model() {
   (( ready == 1 )) || fail "${model} server did not start; see ${log_dir}/server.log"
 
   local -a video_args=()
-  [[ "${SAVE_VIDEOS}" == "1" ]] && video_args=(--args.save-videos)
-  local failures=0 suite pert out_dir pid running
+  if [[ "${SAVE_VIDEOS}" == "1" ]]; then video_args=(--args.save-videos); fi
+  local failures=0 suite pert task_id out_dir pid running
+  local n_tasks=10
+  if (( MAX_TASKS > 0 )); then n_tasks="${MAX_TASKS}"; fi
   WORKER_PIDS=()
-  for suite in "${TASK_SUITES[@]}"; do
+  # One worker per (suite, perturbation, task); longest-horizon suites first so
+  # libero_10 does not become the tail.  Each task's env is seeded on its own.
+  for suite in "${ORDERED_SUITES[@]}"; do
     for pert in "${PERTURBATIONS[@]}"; do
+      for ((task_id = 0; task_id < n_tasks; task_id++)); do
       # Throttle by polling; final per-PID waits below collect every exit status.
       while true; do
         kill -0 "${SERVER_PID}" 2>/dev/null || fail "${model} server exited during evaluation; see ${log_dir}/server.log"
         running=0
         for pid in "${WORKER_PIDS[@]:-}"; do
-          [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && running=$((running + 1))
+          if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then running=$((running + 1)); fi
         done
         (( running < MAX_PARALLEL_WORKERS )) && break
         sleep 5
       done
-      out_dir="${model_root}/${suite}/${pert}"
+      out_dir="$(printf '%s/%s/%s/task_%02d' "${model_root}" "${suite}" "${pert}" "${task_id}")"
       mkdir -p "${out_dir}"
       CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON}" examples/simBenchmarks/LIBERO/eval_files/eval_libero_pro.py \
         --args.host 127.0.0.1 --args.port "${PORT}" \
         --args.task-suite-name "${suite}" --args.perturbation "${pert}" \
-        --args.num-trials-per-task "${NUM_TRIALS_PER_TASK}" --args.max-tasks "${MAX_TASKS}" \
+        --args.num-trials-per-task "${NUM_TRIALS_PER_TASK}" \
+        --args.task-id-start "${task_id}" --args.task-id-end "$((task_id + 1))" \
         --args.max-steps "${MAX_STEPS}" --args.seed "${SEED}" --args.unnorm-key "${UNNORM_KEY}" \
         "${video_args[@]}" \
-        --args.video-out-path "${out_dir}" >"${log_dir}/${suite}_${pert}.log" 2>&1 &
+        --args.video-out-path "${out_dir}" >"$(printf '%s/%s_%s_task%02d.log' "${log_dir}" "${suite}" "${pert}" "${task_id}")" 2>&1 &
       WORKER_PIDS+=("$!")
-      echo "[$(date '+%F %T')] ${model}: launched ${suite}/${pert} (pid $!)"
+      echo "[$(date '+%F %T')] ${model}: launched ${suite}/${pert}/task_${task_id} (pid $!)"
+      done
     done
   done
   for pid in "${WORKER_PIDS[@]}"; do
