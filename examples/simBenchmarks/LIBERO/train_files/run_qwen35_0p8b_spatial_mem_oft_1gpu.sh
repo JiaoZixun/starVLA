@@ -10,10 +10,14 @@
 #   bash run_qwen35_0p8b_spatial_mem_oft_1gpu.sh          # run both stages
 #   STAGE=a bash run_qwen35_0p8b_spatial_mem_oft_1gpu.sh  # stage A only
 #   STAGE=b bash run_qwen35_0p8b_spatial_mem_oft_1gpu.sh  # stage B only
+#   STAGE=full bash run_qwen35_0p8b_spatial_mem_oft_1gpu.sh
+#       single stage: load Spatial 50k and train all modules for 50k steps
+#       (separate run dir qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k;
+#       re-running resumes from its latest checkpoint)
 #
 # Environment variables:
 #   GPU_ID     — CUDA device index to use (default: 0)
-#   STAGE      — a | b | all (default: all)
+#   STAGE      — a | b | all | full (default: all)
 #   WANDB_MODE — offline | disabled | online (default: offline)
 set -euo pipefail
 
@@ -24,6 +28,7 @@ STAGE="${STAGE:-all}"
 RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_libero_50k"
 STAGE_A_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_a.yaml"
 STAGE_B_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_b.yaml"
+FULL_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_full.yaml"
 QWEN35_REVISION="${QWEN35_REVISION:-2fc06364715b967f1860aea9cf38778875588b17}"
 HF_HOME="${HF_HOME:-/data1/jiaozx/.cache/huggingface}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
@@ -39,7 +44,8 @@ nvidia-smi -i "${GPU_ID}" --query-gpu=index --format=csv,noheader,nounits >/dev/
 
 case "${STAGE}" in
   a|b|all) ;;
-  *) fail "STAGE must be a, b, or all." ;;
+  full) RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k" ;;
+  *) fail "STAGE must be a, b, all, or full." ;;
 esac
 
 # A measured full-unfreeze batch of 32 peaks near 30.3 GiB with AdamW state.
@@ -163,6 +169,11 @@ if [[ "${STAGE}" == a || "${STAGE}" == all ]]; then
     fi
     echo "=== Starting Stage A — memory warmup (5 000 steps, frozen spatial) on GPU ${GPU_ID} ==="
     run_train "${STAGE_A_CONFIG}"
+fi
+
+if [[ "${STAGE}" == full ]]; then
+    echo "=== Starting single-stage full training (Spatial 50k init, 50 000 steps, batch 32) on GPU ${GPU_ID} ==="
+    run_train "${FULL_CONFIG}"
 fi
 
 if [[ "${STAGE}" == b || "${STAGE}" == all ]]; then
