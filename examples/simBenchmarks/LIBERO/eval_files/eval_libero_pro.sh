@@ -180,6 +180,21 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Run one simulator worker in the background and record its exit code in a
+# file.  Per-PID `wait` cannot report worker status: a full run starts far more
+# processes than pid_max, PIDs wrap, and bash discards the saved status of a
+# finished worker once a later child reuses its PID ("pid N is not a child of
+# this shell"), which used to count successful workers as failures.
+run_worker() {
+  local status_file="$1" log_file="$2" child="" rc=0
+  shift 2
+  trap '[[ -n "${child}" ]] && kill "${child}" 2>/dev/null; exit 143' TERM
+  "$@" >"${log_file}" 2>&1 &
+  child=$!
+  wait "${child}" || rc=$?
+  echo "${rc}" >"${status_file}"
+}
+
 run_model() {
   local model="$1" ckpt model_root log_dir
   ckpt="$(ckpt_for "${model}")"
@@ -209,16 +224,17 @@ run_model() {
 
   local -a video_args=()
   if [[ "${SAVE_VIDEOS}" == "1" ]]; then video_args=(--args.save-videos); fi
-  local failures=0 suite pert task_id out_dir pid running
+  local failures=0 suite pert task_id out_dir pid running status_file rc
   local n_tasks=10
   if (( MAX_TASKS > 0 )); then n_tasks="${MAX_TASKS}"; fi
+  local -a status_files=()
   WORKER_PIDS=()
   # One worker per (suite, perturbation, task); longest-horizon suites first so
   # libero_10 does not become the tail.  Each task's env is seeded on its own.
   for suite in "${ORDERED_SUITES[@]}"; do
     for pert in "${PERTURBATIONS[@]}"; do
       for ((task_id = 0; task_id < n_tasks; task_id++)); do
-      # Throttle by polling; final per-PID waits below collect every exit status.
+      # Throttle by polling; each worker's exit code is read from its status file.
       while true; do
         kill -0 "${SERVER_PID}" 2>/dev/null || fail "${model} server exited during evaluation; see ${log_dir}/server.log"
         running=0
@@ -230,21 +246,34 @@ run_model() {
       done
       out_dir="$(printf '%s/%s/%s/task_%02d' "${model_root}" "${suite}" "${pert}" "${task_id}")"
       mkdir -p "${out_dir}"
-      CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON}" examples/simBenchmarks/LIBERO/eval_files/eval_libero_pro.py \
+      status_file="${out_dir}/exit_status"
+      rm -f "${status_file}"
+      status_files+=("${status_file}")
+      CUDA_VISIBLE_DEVICES="${GPU_ID}" run_worker "${status_file}" \
+        "$(printf '%s/%s_%s_task%02d.log' "${log_dir}" "${suite}" "${pert}" "${task_id}")" \
+        "${PYTHON}" examples/simBenchmarks/LIBERO/eval_files/eval_libero_pro.py \
         --args.host 127.0.0.1 --args.port "${PORT}" \
         --args.task-suite-name "${suite}" --args.perturbation "${pert}" \
         --args.num-trials-per-task "${NUM_TRIALS_PER_TASK}" \
         --args.task-id-start "${task_id}" --args.task-id-end "$((task_id + 1))" \
         --args.max-steps "${MAX_STEPS}" --args.seed "${SEED}" --args.unnorm-key "${UNNORM_KEY}" \
         "${video_args[@]}" \
-        --args.video-out-path "${out_dir}" >"$(printf '%s/%s_%s_task%02d.log' "${log_dir}" "${suite}" "${pert}" "${task_id}")" 2>&1 &
+        --args.video-out-path "${out_dir}" &
       WORKER_PIDS+=("$!")
       echo "[$(date '+%F %T')] ${model}: launched ${suite}/${pert}/task_${task_id} (pid $!)"
       done
     done
   done
+  # Barrier only: a PID whose status bash already discarded has exited.
   for pid in "${WORKER_PIDS[@]}"; do
-    wait "${pid}" || failures=$((failures + 1))
+    wait "${pid}" 2>/dev/null || true
+  done
+  for status_file in "${status_files[@]}"; do
+    rc="$(cat "${status_file}" 2>/dev/null || echo missing)"
+    if [[ "${rc}" != "0" ]]; then
+      failures=$((failures + 1))
+      echo "${model}: worker $(dirname "${status_file}") exit status ${rc}" >&2
+    fi
   done
   WORKER_PIDS=()
   kill "${SERVER_PID}" 2>/dev/null || true
