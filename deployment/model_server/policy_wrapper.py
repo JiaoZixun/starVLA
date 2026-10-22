@@ -158,7 +158,10 @@ class PolicyServerWrapper:
                 "decision_stride_env_steps": int(self._framework.memory_config.action_horizon),
                 "visual_views": 2,
                 "visual_grid_size": int(self._framework.memory_config.visual_pool_grid[0]),
-                "visual_feature_dim": 3,
+                "visual_feature_dim": int(self._framework.event_encoder.visual_projection.in_features // 3),
+                # "qwen": the server attaches its own pooled Qwen features by
+                # step; clients send event metadata only.
+                "visual_source": str(getattr(self._framework, "memory_visual_source", "rgb")),
             }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:

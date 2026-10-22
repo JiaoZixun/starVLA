@@ -136,6 +136,8 @@ class MemoryLibero4in1DataConfig(SpatialLibero4in1DataConfig):
             # The mixture sampler only draws stride-aligned anchors when this is
             # true; keep the dataset-side check in sync with it.
             memory_aligned_anchors_only=bool(data_cfg.get("memory_decision_frame_only", True)),
+            memory_visual_source=str(data_cfg.get("memory_visual_source", "rgb")),
+            qwen_visual_sidecar_root=data_cfg.get("qwen_visual_sidecar_root"),
         )
 
 

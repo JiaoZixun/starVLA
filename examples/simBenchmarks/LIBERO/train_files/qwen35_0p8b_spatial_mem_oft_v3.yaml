@@ -1,0 +1,144 @@
+run_id: qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k
+run_root_dir: playground/Checkpoints
+seed: 42
+is_debug: false
+
+framework:
+  name: QwenSpatialMemOFT
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    # Resolve this Hub id to the local snapshot before loading; no network access.
+    local_files_only: true
+    local_model_path: null
+    attn_implementation: sdpa
+    revision: 2fc06364715b967f1860aea9cf38778875588b17
+    gradient_checkpointing: false
+  action_model:
+    action_dim: 7
+    action_hidden_dim: 1024
+    action_model_type: MLP
+    action_horizon: 8
+    future_action_window_size: 7
+    past_action_window_size: 0
+  spatial:
+    width: 256
+    heads: 4
+    ffn_width: 1024
+    layers: 2
+    # Must match the reused Spatial 50k checkpoint: it was trained with
+    # tau=[1,2,4,8] and the ungated (v1) adapter without a gripper head.
+    adapter_version: v1
+    tau: [1, 2, 4, 8]
+    waypoint_weight: 1.0
+    waypoint_rotation_weight: 0.25
+    action_geometry_weight: 0.0
+    effect_weight: 0.0
+  memory:
+    width: 256
+    heads: 4
+    ffn_width: 1024
+    event_encoder_layers: 1
+    reader_layers: 2
+    event_tokens: 8
+    summary_tokens: 1
+    capacity_events: 128
+    visual_pool_grid: [4, 4]
+    dropout: 0.0
+    # Training-only: drop the whole history (falls back to the Spatial path)
+    # or replace an event's executed actions with a learned mask token.
+    history_dropout: 0.1
+    event_action_dropout: 0.3
+    # Event visuals: the frozen Qwen vision tower's pooled tokens (offline
+    # sidecar in training, the model's own forward in eval).  The launcher
+    # fills visual_fingerprint from the sidecar manifest.
+    visual_source: qwen
+    visual_fingerprint: null
+  # Action queries cross-attend to several Qwen layers (text, agent-view and
+  # wrist-view tokens labelled) plus a measured-proprioception token.  The
+  # zero-initialized output keeps step 0 identical to Spatial OFT.
+  bridge:
+    hidden_layers: [6, 12, 18, 24]
+    width: 256
+    heads: 4
+    ffn_width: 1024
+    layers: 2
+    # eef position (3), eef rotation 6D (6), gripper qpos (2); statistics over
+    # all 273,465 frames of the four LIBERO training sets.
+    proprio_mean: [-0.0465, 0.0344, 0.7646, 0.8182, -0.1077, -0.0347, -0.1099, -0.8243, 0.0114, 0.0269, -0.0272]
+    proprio_std: [0.1049, 0.1518, 0.3785, 0.3343, 0.4274, 0.1528, 0.3777, 0.3418, 0.2211, 0.0142, 0.0141]
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_spatial_mem_oft_all
+    geometry_sidecar_root: playground/DerivedData/libero_spatial_oft_v1
+    memory_sidecar_root: playground/DerivedData/libero_spatial_mem_v2
+    memory_visual_source: qwen
+    qwen_visual_sidecar_root: playground/DerivedData/libero_qwen_visual_v1
+    waypoint_tau: [1, 2, 4, 8]
+    memory_decision_stride_env_steps: 8
+    memory_capacity_events: 128
+    # false: sample every valid frame; the event grid is phase-shifted to end
+    # at the anchor (complete 8-step intervals only).  Eval stays stride-aligned.
+    memory_decision_frame_only: false
+    drop_incomplete_action_chunks: true
+    per_device_batch_size: 32
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    video_backend: torchvision_av
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+
+trainer:
+  # Single stage: load the Spatial 50k checkpoint and train every module for
+  # 50k steps at batch 32 (no frozen memory warmup).  The new memory modules
+  # start from zero-initialized residuals, so step 0 reproduces Spatial OFT;
+  # they get higher LRs than the converged Spatial/Qwen weights.
+  max_train_steps: 50000
+  num_warmup_steps: 2000
+  save_interval: 5000
+  eval_interval: 100
+  learning_rate:
+    base: 2.5e-5
+    qwen_vl_interface: 2.0e-6
+    action_model: 5.0e-5
+    waypoint_model: 2.0e-5
+    spatial_adapter: 2.0e-5
+    event_encoder: 1.0e-4
+    memory_reader: 1.0e-4
+    action_memory_projection: 1.0e-4
+    action_memory_gate: 1.0e-4
+    action_memory_output: 1.0e-4
+    waypoint_memory_projection: 1.0e-4
+    proprio_memory_projection: 1.0e-4
+    task_memory_projection: 1.0e-4
+    waypoint_twist_head: 1.0e-4
+    proprio_layer_bridge: 1.0e-4
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-6
+  # The Qwen visual sidecar was computed from this vision tower; the model
+  # refuses to train if it is trainable or its fingerprint differs.
+  freeze_modules: "qwen_vl_interface.model.model.visual"
+  # Resume from this run's latest checkpoint after a crash; otherwise start
+  # from the Spatial checkpoint below.
+  is_resume: true
+  resume_warmup_steps: 1000
+  pretrained_checkpoint: playground/Checkpoints/qwen35_0p8b_spatial_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt
+  reload_modules: qwen_vl_interface,action_model,waypoint_model,spatial_adapter
+  strict_reload: true
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 100
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  gradient_checkpointing: false
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8

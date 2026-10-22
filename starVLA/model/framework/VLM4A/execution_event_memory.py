@@ -54,11 +54,14 @@ class EventEncoderBlock(nn.Module):
 class ExecutionEventEncoder(nn.Module):
     """Encode one completed interval from shared Qwen visual tokens and observed actions."""
 
-    def __init__(self, visual_dim: int, config: MemoryConfig):
+    def __init__(self, visual_dim: int, config: MemoryConfig, visual_input_norm: bool = False):
         super().__init__()
         self.config = config
         width = config.width
         visual_tokens = 2 * config.visual_pool_grid[0] * config.visual_pool_grid[1]
+        # Unit-scale RGB summaries need no normalization; high-dimensional Qwen
+        # features are normalized per frame before the start/end/delta concat.
+        self.visual_input_norm = nn.LayerNorm(visual_dim) if visual_input_norm else None
         self.visual_projection = nn.Linear(3 * visual_dim, width)
         self.visual_position = nn.Parameter(torch.zeros(1, visual_tokens, width))
         self.view_embedding = nn.Embedding(2, width)
@@ -100,6 +103,9 @@ class ExecutionEventEncoder(nn.Module):
             raise ValueError(
                 f"Completed event actions must be [B,{self.config.action_horizon},7], got {tuple(actions.shape)}"
             )
+        if self.visual_input_norm is not None:
+            visual_start = self.visual_input_norm(visual_start.float())
+            visual_end = self.visual_input_norm(visual_end.float())
         visual_delta = visual_end - visual_start
         visual = torch.cat((visual_start, visual_end, visual_delta), dim=-1).reshape(batch, 2 * patches, 3 * dim)
         view_ids = torch.arange(views, device=visual.device).repeat_interleave(patches)

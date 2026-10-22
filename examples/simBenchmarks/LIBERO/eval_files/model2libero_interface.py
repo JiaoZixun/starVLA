@@ -65,7 +65,8 @@ class ModelClient:
         memory_contract = meta.get("memory_contract", {})
         self.memory_buffer = (
             LiberoExecutionEventBuffer(
-                capacity=int(memory_contract.get("capacity_events", MEMORY_CAPACITY_EVENTS))
+                capacity=int(memory_contract.get("capacity_events", MEMORY_CAPACITY_EVENTS)),
+                include_visual=memory_contract.get("visual_source", "rgb") == "rgb",
             )
             if self.memory_enabled
             else None

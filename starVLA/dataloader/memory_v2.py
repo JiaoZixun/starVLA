@@ -16,6 +16,10 @@ VISUAL_POOL_GRID = (4, 4)
 VISUAL_TOKENS_PER_VIEW = VISUAL_POOL_GRID[0] * VISUAL_POOL_GRID[1]
 VISUAL_FEATURE_DIM = 3
 VISUAL_IMAGE_SIZE = (224, 224)
+# "qwen" memory visuals: frozen Qwen3.5 post-merger tokens pooled 4x4 per view.
+QWEN_VISUAL_FEATURE_DIM = 1024
+QWEN_VISUAL_SIDECAR_FORMAT = "starvla_libero_qwen_pooled_visual_v1"
+QWEN_VISUAL_SIDECAR_FILE = "obs_qwen_pooled.npy"
 
 
 def image_to_memory_visual_tokens(image: Any) -> np.ndarray:
@@ -64,21 +68,28 @@ def build_execution_event(
     pose_start_in_episode: Any,
     pose_end_in_episode: Any,
 ) -> dict[str, Any]:
-    """Validate and pack an observed, completed interval; no success labels are inferred."""
+    """Validate and pack an observed, completed interval; no success labels are inferred.
+
+    ``visual_start``/``visual_end`` may both be None when the model resolves
+    event visuals by step (``memory.visual_source=qwen``).
+    """
     start_step, end_step = int(start_step), int(end_step)
     if start_step < 0 or end_step - start_step != MEMORY_STRIDE:
         raise ValueError(f"Execution event must span exactly {MEMORY_STRIDE} steps: {start_step}->{end_step}")
-    visual_start = np.asarray(visual_start)
-    visual_end = np.asarray(visual_end)
-    expected_visual_shape = (VISUAL_VIEWS, VISUAL_TOKENS_PER_VIEW, VISUAL_FEATURE_DIM)
-    if visual_start.shape != expected_visual_shape:
-        raise ValueError(f"visual_start must have shape {expected_visual_shape}, got {visual_start.shape}")
-    if visual_end.shape != visual_start.shape:
-        raise ValueError(f"visual_end shape {visual_end.shape} != visual_start shape {visual_start.shape}")
-    if not np.isfinite(visual_start).all() or not np.isfinite(visual_end).all():
-        raise ValueError("Visual features must be finite")
-    if visual_start.min(initial=0) < 0 or visual_start.max(initial=0) > 1 or visual_end.min(initial=0) < 0 or visual_end.max(initial=0) > 1:
-        raise ValueError("Memory visual RGB features must be scaled to [0,1]")
+    if (visual_start is None) != (visual_end is None):
+        raise ValueError("visual_start and visual_end must both be set or both be None")
+    if visual_start is not None:
+        visual_start = np.asarray(visual_start)
+        visual_end = np.asarray(visual_end)
+        expected_visual_shape = (VISUAL_VIEWS, VISUAL_TOKENS_PER_VIEW, VISUAL_FEATURE_DIM)
+        if visual_start.shape != expected_visual_shape:
+            raise ValueError(f"visual_start must have shape {expected_visual_shape}, got {visual_start.shape}")
+        if visual_end.shape != visual_start.shape:
+            raise ValueError(f"visual_end shape {visual_end.shape} != visual_start shape {visual_start.shape}")
+        if not np.isfinite(visual_start).all() or not np.isfinite(visual_end).all():
+            raise ValueError("Visual features must be finite")
+        if visual_start.min(initial=0) < 0 or visual_start.max(initial=0) > 1 or visual_end.min(initial=0) < 0 or visual_end.max(initial=0) > 1:
+            raise ValueError("Memory visual RGB features must be scaled to [0,1]")
     return {
         "start_step": start_step,
         "end_step": end_step,
@@ -130,8 +141,11 @@ class EpisodeEventHistory:
 class LiberoExecutionEventBuffer:
     """Build the same completed 8-step events online that training builds offline."""
 
-    def __init__(self, capacity: int = MEMORY_CAPACITY_EVENTS):
+    def __init__(self, capacity: int = MEMORY_CAPACITY_EVENTS, include_visual: bool = True):
         self.history = EpisodeEventHistory(capacity=capacity)
+        # False for memory.visual_source=qwen: the model attaches its own
+        # pooled Qwen features to events by step.
+        self.include_visual = bool(include_visual)
         self.pending: dict[str, Any] | None = None
         self.executed_actions: list[np.ndarray] = []
 
@@ -160,7 +174,11 @@ class LiberoExecutionEventBuffer:
         env_step = int(env_step)
         if env_step < 0 or env_step % MEMORY_STRIDE:
             raise ValueError(f"LIBERO memory queries must align to the {MEMORY_STRIDE}-step stride: {env_step}")
-        visual = np.stack([image_to_memory_visual_tokens(image) for image in example["image"]])
+        visual = (
+            np.stack([image_to_memory_visual_tokens(image) for image in example["image"]])
+            if self.include_visual
+            else None
+        )
         state = self._state(example)
         pose = self._pose(example)
         if self.pending is not None:
@@ -217,6 +235,9 @@ __all__ = [
     "LiberoExecutionEventBuffer",
     "MEMORY_CAPACITY_EVENTS",
     "MEMORY_STRIDE",
+    "QWEN_VISUAL_FEATURE_DIM",
+    "QWEN_VISUAL_SIDECAR_FILE",
+    "QWEN_VISUAL_SIDECAR_FORMAT",
     "VISUAL_POOL_GRID",
     "VISUAL_FEATURE_DIM",
     "VISUAL_IMAGE_SIZE",

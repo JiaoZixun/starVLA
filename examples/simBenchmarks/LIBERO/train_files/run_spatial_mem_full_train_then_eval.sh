@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Sequential pipeline for Qwen3.5-0.8B Spatial-Mem v2, single-stage full training.
+# Sequential pipeline for Qwen3.5-0.8B Spatial-Mem single-stage training.
+#
+#   TRAIN_STAGE=full (default): memv2, RGB event visuals.
+#   TRAIN_STAGE=v3: proprio/multi-layer bridge + frozen-Qwen event visuals
+#                   (requires prepare_qwen_visual_sidecar.py output).
+#   RUN_LIBERO_PLUS=0 skips LIBERO-plus.
 #
 #   1. Train on TRAIN_GPU (default 0): Spatial 50k init, all modules, 50k steps, batch 32.
 #   2. Require the 50 000-step checkpoint.
@@ -28,7 +33,13 @@ STD_INFERENCE_BATCH="${STD_INFERENCE_BATCH:-4}"
 PLUS_TASKS_PER_GPU="${PLUS_TASKS_PER_GPU:-2}"
 NVIDIA_EGL_VENDOR_JSON="${NVIDIA_EGL_VENDOR_JSON:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
 
-RUN_ID="qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k"
+TRAIN_STAGE="${TRAIN_STAGE:-full}"
+RUN_LIBERO_PLUS="${RUN_LIBERO_PLUS:-1}"
+case "${TRAIN_STAGE}" in
+  full) RUN_ID="qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k" ;;
+  v3) RUN_ID="qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k" ;;
+  *) echo "TRAIN_STAGE must be full or v3" >&2; exit 1 ;;
+esac
 RUN_DIR="${STARVLA_DIR}/playground/Checkpoints/${RUN_ID}"
 CKPT="${RUN_DIR}/checkpoints/steps_50000_pytorch_model.pt"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -56,7 +67,7 @@ if [[ -s "${CKPT}" ]]; then
 else
   status training
   log "Training on GPU ${TRAIN_GPU}; log: ${RUN_DIR}/logs/train.log"
-  PYTHON="${PYTHON}" GPU_ID="${TRAIN_GPU}" STAGE=full WANDB_MODE=offline \
+  PYTHON="${PYTHON}" GPU_ID="${TRAIN_GPU}" STAGE="${TRAIN_STAGE}" WANDB_MODE=offline \
     bash examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh \
     >> "${RUN_DIR}/logs/train.log" 2>&1 || { status training_failed; fail "training failed; see ${RUN_DIR}/logs/train.log"; }
 fi
@@ -69,7 +80,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_DISA
 export WANDB_MODE=disabled TOKENIZERS_PARALLELISM=false TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 NO_ALBUMENTATIONS_UPDATE=1
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl __EGL_VENDOR_LIBRARY_FILENAMES="${NVIDIA_EGL_VENDOR_JSON}"
 
-for gpu in "${STD_GPU}" "${PLUS_GPU}"; do
+EVAL_GPUS=("${STD_GPU}")
+[[ "${RUN_LIBERO_PLUS}" == 1 ]] && EVAL_GPUS+=("${PLUS_GPU}")
+for gpu in "${EVAL_GPUS[@]}"; do
   nvidia-smi -i "${gpu}" --query-gpu=index --format=csv,noheader >/dev/null || fail "GPU ${gpu} unavailable"
   CUDA_VISIBLE_DEVICES="${gpu}" MUJOCO_EGL_DEVICE_ID="${gpu}" "${PYTHON}" \
     examples/simBenchmarks/LIBERO/eval_files/check_nvidia_egl.py || fail "NVIDIA EGL check failed on GPU ${gpu}"
@@ -89,6 +102,8 @@ log "Standard LIBERO on GPU ${STD_GPU} (${STD_SIM_WORKERS} workers, batch ${STD_
 ) > "${RESULT_ROOT}/libero_std.log" 2>&1 &
 std_pid=$!
 
+plus_pid=""
+if [[ "${RUN_LIBERO_PLUS}" == 1 ]]; then
 log "LIBERO-plus on GPU ${PLUS_GPU} (4 suites concurrently, TASKS_PER_GPU=${PLUS_TASKS_PER_GPU}) -> ${PLUS_ROOT}"
 (
   unset PYTHONPATH LIBERO_HOME LIBERO_CONFIG_PATH
@@ -98,12 +113,15 @@ log "LIBERO-plus on GPU ${PLUS_GPU} (4 suites concurrently, TASKS_PER_GPU=${PLUS
     bash examples/simBenchmarks/LIBERO-plus/eval_files/parallel_eval/run_local_dual_libero_plus.sh
 ) > "${RESULT_ROOT}/libero_plus.log" 2>&1 &
 plus_pid=$!
+fi
 
 std_status=0; plus_status=0
 wait "${std_pid}" || std_status=$?
 log "Standard LIBERO finished (status=${std_status})."
-wait "${plus_pid}" || plus_status=$?
-log "LIBERO-plus finished (status=${plus_status})."
+if [[ -n "${plus_pid}" ]]; then
+  wait "${plus_pid}" || plus_status=$?
+  log "LIBERO-plus finished (status=${plus_status})."
+fi
 
 # ---------------------------------------------------------------- 3. summary
 "${PYTHON}" - "${STD_ROOT}" "${PLUS_ROOT}/mem" "${RESULT_ROOT}/evaluation_summary.json" "${CKPT}" <<'PY'

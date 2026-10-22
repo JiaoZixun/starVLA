@@ -197,3 +197,48 @@ Train/eval contract notes:
 - Both standard LIBERO and LIBERO-plus evaluators record every command accepted
   by `env.step`. LIBERO-plus must keep `TASKS_PER_GPU=2` to reproduce the
   baseline worker split and sensor-noise stream.
+
+### Qwen3.5 Spatial-Mem v3 (bridge + Qwen event visuals)
+
+`qwen35_0p8b_spatial_mem_oft_v3.yaml` adds two things to memv2:
+
+- `framework.bridge`: the eight action queries cross-attend to Qwen decoder
+  layers 6/12/18/24 (text, agent-view and wrist-view tokens carry a type
+  embedding) plus one measured-proprioception token: TCP position, TCP rotation
+  in 6D form and the two gripper joint positions, normalized with fixed
+  dataset statistics stored in the config. Its output is zero-initialized, so
+  step 0 reproduces Spatial OFT.
+- `memory.visual_source: qwen`: each event's start/end visuals are the frozen
+  Qwen vision tower's post-merger tokens, pooled 4×4 per view (1024-D), not RGB
+  means.
+
+Generate the Qwen visual sidecar from the checkpoint that training reloads, then train:
+
+```bash
+python examples/simBenchmarks/LIBERO/train_files/prepare_qwen_visual_sidecar.py \
+  --checkpoint playground/Checkpoints/qwen35_0p8b_spatial_oft_libero_50k/checkpoints/steps_50000_pytorch_model.pt
+STAGE=v3 bash examples/simBenchmarks/LIBERO/train_files/run_qwen35_0p8b_spatial_mem_oft_1gpu.sh
+# or train, then evaluate standard LIBERO (and optionally LIBERO-plus):
+TRAIN_STAGE=v3 RUN_LIBERO_PLUS=0 bash examples/simBenchmarks/LIBERO/train_files/run_spatial_mem_full_train_then_eval.sh
+```
+
+The sidecar (`playground/DerivedData/libero_qwen_visual_v1`, ~18 GB fp16) holds
+only derived features plus a manifest; source Parquet/MP4 files stay in place.
+
+Train/eval contract notes:
+
+- Frames follow the training path exactly (PyAV decode, PIL bicubic 224×224;
+  verified bit-identical to the `torchvision_av` loader) and use the same
+  processor/pooling code (`Qwen3_5.encode_pooled_images`) as the model's forward.
+- Training reads event visuals from the sidecar; evaluation uses the features
+  this model computed at its own earlier queries of the episode, so clients send
+  event metadata only (`LiberoExecutionEventBuffer(include_visual=False)`).
+- The vision tower is frozen (`trainer.freeze_modules`). The sidecar manifest
+  records a sha256 of its weights; the launcher copies it into
+  `memory.visual_fingerprint`. The model refuses to train or run if the tower is
+  trainable, a sample carries another fingerprint, or its own weights hash
+  differently.
+- `check_spatial_mem_v3.py` verifies step-0 equivalence with Spatial OFT and
+  compares the training sample path with the eval client path over one episode.
+  Remaining action differences are bf16 batch-size effects (≤0.008 in
+  normalized units, vs. 1.2 from enabling history).

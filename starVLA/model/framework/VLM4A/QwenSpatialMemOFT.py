@@ -6,6 +6,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+import hashlib
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,10 +17,17 @@ from starVLA.dataloader.memory_v2 import (
     ACTION_HORIZON,
     MEMORY_CAPACITY_EVENTS,
     MEMORY_STRIDE,
+    QWEN_VISUAL_FEATURE_DIM,
     VISUAL_FEATURE_DIM,
     VISUAL_TOKENS_PER_VIEW,
     VISUAL_VIEWS,
     image_to_memory_visual_tokens,
+)
+from starVLA.model.framework.VLM4A.proprio_layer_bridge import (
+    BridgeConfig,
+    ProprioLayerBridge,
+    bridge_token_types,
+    proprio_features,
 )
 from starVLA.model.framework.VLM4A.QwenOFT import masked_l1_loss
 from starVLA.model.framework.VLM4A.QwenSpatialOFT import QwenSpatialOFT
@@ -35,6 +44,22 @@ from starVLA.model.framework.VLM4A.spatial_geometry import (
 )
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
+
+
+def vision_tower_fingerprint(qwen_vl_interface) -> str:
+    """sha256 over the Qwen vision tower's bf16 weights, in name order.
+
+    Shared by the Qwen visual sidecar writer and the model so the sidecar,
+    the training weights, and the eval weights can be proven identical.
+    """
+    digest = hashlib.sha256()
+    visual = qwen_vl_interface.model.model.visual
+    for name, tensor in sorted(visual.state_dict().items()):
+        value = tensor.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+        digest.update(name.encode())
+        digest.update(str(tuple(value.shape)).encode())
+        digest.update(value.view(torch.int16).numpy().tobytes())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -93,7 +118,32 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 raise ValueError(f"memory.{name} must be in [0, 1)")
         width = self.memory_config.width
         hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
-        self.event_encoder = ExecutionEventEncoder(VISUAL_FEATURE_DIM, self.memory_config)
+        # "rgb": 4x4 RGB means (memv2 checkpoints).  "qwen": the frozen Qwen
+        # vision tower's pooled post-merger tokens, from an offline sidecar in
+        # training and from this model's own forward in eval.
+        self.memory_visual_source = str(memory.get("visual_source", "rgb"))
+        if self.memory_visual_source not in ("rgb", "qwen"):
+            raise ValueError(f"memory.visual_source must be rgb or qwen, got {self.memory_visual_source!r}")
+        qwen_visual = self.memory_visual_source == "qwen"
+        if qwen_visual and hidden_size != QWEN_VISUAL_FEATURE_DIM:
+            raise ValueError(f"Qwen visual memory expects {QWEN_VISUAL_FEATURE_DIM}-D features, got {hidden_size}")
+        self.memory_visual_fingerprint = memory.get("visual_fingerprint")
+        if qwen_visual and not self.memory_visual_fingerprint:
+            raise ValueError("memory.visual_source=qwen requires memory.visual_fingerprint from the sidecar manifest")
+        self._vision_fingerprint_verified = False
+        self.event_encoder = ExecutionEventEncoder(
+            QWEN_VISUAL_FEATURE_DIM if qwen_visual else VISUAL_FEATURE_DIM,
+            self.memory_config,
+            visual_input_norm=qwen_visual,
+        )
+        bridge = self.config.framework.get("bridge")
+        self.bridge_config = BridgeConfig.from_dict(dict(bridge)) if bridge else None
+        if self.bridge_config is not None:
+            layer_count = int(self.qwen_vl_interface.model.config.text_config.num_hidden_layers)
+            if max(self.bridge_config.hidden_layers) > layer_count:
+                raise ValueError(f"bridge.hidden_layers exceed the {layer_count} Qwen decoder layers")
+            self.proprio_layer_bridge = ProprioLayerBridge(hidden_size, self.bridge_config)
+            self.image_token_id = int(self.qwen_vl_interface.model.config.image_token_id)
         self.memory_reader = CausalMemoryReader(self.memory_config)
         self.action_memory_projection = nn.Linear(hidden_size, width)
         self.action_memory_gate = nn.Sequential(nn.Linear(width * 2, width), nn.Sigmoid())
@@ -109,9 +159,42 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         # Runtime-only encoded-event cache. Event IDs are episode-local, and
         # cached tokens never enter state_dict/checkpoints.
         self._eval_event_cache: OrderedDict[str, dict[tuple[int, int], np.ndarray]] = OrderedDict()
+        # Qwen-visual eval cache: episode -> {env_step: fp16 [2,16,D]} for the
+        # latest query, which is the start frame of the next event.
+        self._eval_visual_cache: OrderedDict[str, dict[int, np.ndarray]] = OrderedDict()
         self._max_cached_episodes = 64
 
-    def _build_inputs_with_visual(self, examples: list[dict[str, Any]]) -> tuple[dict, torch.Tensor, torch.Tensor]:
+    def vision_tower_fingerprint(self) -> str:
+        return vision_tower_fingerprint(self.qwen_vl_interface)
+
+    def _verify_qwen_visual_contract(self, examples: list[dict[str, Any]], *, train: bool) -> None:
+        """Training sidecar, training weights, and eval weights must share one vision tower."""
+        if self.memory_visual_source != "qwen":
+            return
+        if train:
+            trainable = [n for n, p in self.qwen_vl_interface.model.model.visual.named_parameters() if p.requires_grad]
+            if trainable:
+                raise ValueError(
+                    "memory.visual_source=qwen requires a frozen vision tower "
+                    "(trainer.freeze_modules: qwen_vl_interface.model.model.visual); "
+                    f"trainable: {trainable[:3]}"
+                )
+            for example in examples:
+                found = example.get("memory_contract", {}).get("visual_fingerprint")
+                if found != self.memory_visual_fingerprint:
+                    raise ValueError(f"Sample visual sidecar fingerprint {found} != {self.memory_visual_fingerprint}")
+        if not self._vision_fingerprint_verified:
+            actual = self.vision_tower_fingerprint()
+            if actual != self.memory_visual_fingerprint:
+                raise ValueError(
+                    f"Vision tower fingerprint {actual} != memory.visual_fingerprint {self.memory_visual_fingerprint}; "
+                    "the Qwen visual sidecar was computed from different vision weights"
+                )
+            self._vision_fingerprint_verified = True
+
+    def _build_inputs_with_visual(
+        self, examples: list[dict[str, Any]]
+    ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
         image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if image_size:
@@ -128,14 +211,22 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
         instructions = [instruction + prompt_suffix for instruction in instructions]
         inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        hidden_layers = self.bridge_config.hidden_layers if self.bridge_config is not None else None
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=inputs["input_ids"].device.type == "cuda"):
-            hidden, _ = self.qwen_vl_interface.forward_features(
+            outputs = self.qwen_vl_interface.forward_features(
                 **inputs,
                 use_cache=False,
                 output_hidden_states=False,
                 output_attentions=False,
                 pool_grid=self.memory_config.visual_pool_grid,
+                hidden_layers=hidden_layers,
             )
+        hidden, pooled = outputs[0], outputs[1]
+        layer_features = outputs[2] if hidden_layers is not None else None
+        if self.memory_visual_source == "qwen":
+            # Same rounding as the fp16 sidecar used in training.
+            visual = pooled.detach().to(torch.float16).float()
+            return inputs, hidden, visual, layer_features
         visual_rows = []
         for example in examples:
             visual = example.get("memory_visual_tokens")
@@ -148,7 +239,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 raise ValueError("memory_visual_tokens must be finite RGB values in [0,1]")
             visual_rows.append(visual)
         visual = torch.as_tensor(np.stack(visual_rows), device=hidden.device, dtype=torch.float32)
-        return inputs, hidden, visual
+        return inputs, hidden, visual, layer_features
 
     @staticmethod
     def _tensor(value: Any, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -163,6 +254,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         *,
         train: bool,
         episode_ids: list[str | None],
+        visual_lookup=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = len(event_lists)
         max_events = max((len(events) for events in event_lists), default=0)
@@ -179,6 +271,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         starts = torch.zeros((batch, max_events), dtype=torch.long, device=device)
         ends = torch.zeros((batch, max_events), dtype=torch.long, device=device)
         missing_events: list[dict[str, Any]] = []
+        missing_keys: list[tuple[int, int, int]] = []  # (batch row, start, end)
         cached_tokens: dict[tuple[int, int], np.ndarray] = {}
         for b, events in enumerate(event_lists):
             previous_end = -1
@@ -197,6 +290,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                         cached_tokens[(b, index)] = episode_cache[cache_key]
                         continue
                 missing_events.append(event)
+                missing_keys.append((b, start, end))
 
         encoded = torch.zeros(
             (batch, max_events, token_count, self.memory_config.width), device=device, dtype=torch.float32
@@ -207,9 +301,14 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 torch.rand(len(missing_events), device=device) < self.memory_config.event_action_dropout
             )
         if missing_events:
+            if visual_lookup is not None:
+                visual_start, visual_end = visual_lookup(missing_keys)
+            else:
+                visual_start = self._tensor(np.stack([event["visual_start"] for event in missing_events]), device, torch.float32)
+                visual_end = self._tensor(np.stack([event["visual_end"] for event in missing_events]), device, torch.float32)
             encoded_missing = self.event_encoder(
-                self._tensor(np.stack([event["visual_start"] for event in missing_events]), device, torch.float32),
-                self._tensor(np.stack([event["visual_end"] for event in missing_events]), device, torch.float32),
+                visual_start,
+                visual_end,
                 self._tensor(np.stack([event["state_start"] for event in missing_events]), device, torch.float32),
                 self._tensor(np.stack([event["state_end"] for event in missing_events]), device, torch.float32),
                 self._tensor(np.stack([event["executed_actions"] for event in missing_events]), device, torch.float32),
@@ -241,6 +340,86 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             while len(self._eval_event_cache) > self._max_cached_episodes:
                 self._eval_event_cache.popitem(last=False)
         return encoded, valid, starts, ends
+
+    def _qwen_visual_lookup(
+        self,
+        examples: list[dict[str, Any]],
+        event_lists: list[list[dict[str, Any]]],
+        episode_ids: list[str | None],
+        current_visual: torch.Tensor,
+        query_steps: list[int],
+        *,
+        train: bool,
+    ):
+        """Return a ``[(row, start, end)] -> (visual_start, visual_end)`` resolver.
+
+        Rows with ``memory_visual_bank`` (training samples) read the fp16 Qwen
+        sidecar; eval rows read the features this model produced at earlier
+        queries of the same episode.  Both hold the same frozen-tower values.
+        """
+        device = current_visual.device
+        bank_rows: dict[tuple[int, int], int] = {}
+        bank_parts = []
+        offset = 0
+        for b, example in enumerate(examples):
+            steps = example.get("memory_visual_bank_steps")
+            if steps is None:
+                if train and event_lists[b]:
+                    raise ValueError("Training QwenSpatialMemOFT with qwen visuals requires memory_visual_bank")
+                continue
+            values = np.asarray(example["memory_visual_bank"])
+            steps = np.asarray(steps).reshape(-1)
+            if values.dtype != np.float16 or values.shape != (len(steps), VISUAL_VIEWS, VISUAL_TOKENS_PER_VIEW, QWEN_VISUAL_FEATURE_DIM):
+                raise ValueError(f"memory_visual_bank must be fp16 [N,2,16,{QWEN_VISUAL_FEATURE_DIM}], got {values.shape}/{values.dtype}")
+            bank_parts.append(torch.from_numpy(values))
+            bank_rows.update({(b, int(step)): offset + index for index, step in enumerate(steps)})
+            offset += len(steps)
+        bank = torch.cat(bank_parts).to(device, non_blocking=True) if bank_parts else None
+
+        for b, example in enumerate(examples):
+            if example.get("memory_visual_bank_steps") is not None:
+                continue
+            if episode_ids[b] is None:
+                # A sample without history (e.g. the first 8 steps of a
+                # training episode) needs no visuals; eval clients always send
+                # an episode id so later queries can find this frame.
+                if event_lists[b]:
+                    raise ValueError("Eval with qwen visual memory requires memory_episode_id")
+                continue
+            cache = self._eval_visual_cache.setdefault(str(episode_ids[b]), {})
+            cache[int(query_steps[b])] = current_visual[b].detach().to(torch.float16).cpu().numpy()
+
+        def lookup(keys: list[tuple[int, int, int]]) -> tuple[torch.Tensor, torch.Tensor]:
+            def frame(b: int, step: int) -> torch.Tensor:
+                if (b, step) in bank_rows:
+                    return bank[bank_rows[(b, step)]]
+                cache = self._eval_visual_cache.get(str(episode_ids[b]), {})
+                if step not in cache:
+                    raise KeyError(f"No Qwen visual feature for episode {episode_ids[b]} step {step}")
+                return torch.from_numpy(cache[step]).to(device)
+
+            if bank is not None and all((b, s) in bank_rows and (b, e) in bank_rows for b, s, e in keys):
+                # Training: one gather on the GPU, no per-event host copies.
+                starts = torch.as_tensor([bank_rows[(b, s)] for b, s, _ in keys], device=device)
+                ends = torch.as_tensor([bank_rows[(b, e)] for b, _, e in keys], device=device)
+                return bank[starts].float(), bank[ends].float()
+            visual_start = torch.stack([frame(b, s) for b, s, _ in keys]).float()
+            visual_end = torch.stack([frame(b, e) for b, _, e in keys]).float()
+            return visual_start, visual_end
+
+        return lookup
+
+    def _prune_eval_visual_cache(self, episode_ids: list[str | None], query_steps: list[int]) -> None:
+        # The next event starts at this query; older frames are never needed.
+        for episode_id, step in zip(episode_ids, query_steps):
+            if episode_id is None or str(episode_id) not in self._eval_visual_cache:
+                continue
+            cache = self._eval_visual_cache[str(episode_id)]
+            for key in [key for key in cache if key != int(step)]:
+                del cache[key]
+            self._eval_visual_cache.move_to_end(str(episode_id))
+        while len(self._eval_visual_cache) > self._max_cached_episodes:
+            self._eval_visual_cache.popitem(last=False)
 
     @property
     def memory_encoder(self):
@@ -279,6 +458,7 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
         *,
         train: bool,
         event_lists: list[list[dict[str, Any]]] | None = None,
+        layer_features: torch.Tensor | None = None,
     ):
         device = last_hidden.device
         batch = len(examples)
@@ -289,7 +469,21 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             last_hidden, qwen_inputs["input_ids"], action_token_id=self.action_token_id
         )
         attention_mask = qwen_inputs.get("attention_mask")
+        self._verify_qwen_visual_contract(examples, train=train)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            bridge_residual = None
+            if self.bridge_config is not None:
+                if layer_features is None:
+                    raise ValueError("bridge is enabled but no Qwen layer features were computed")
+                token_types = bridge_token_types(qwen_inputs["input_ids"], self.image_token_id)
+                # Measured TCP pose + gripper qpos, the same values eval sends.
+                action_queries, bridge_residual = self.proprio_layer_bridge(
+                    action_queries,
+                    layer_features,
+                    token_types,
+                    attention_mask,
+                    proprio_features(anchor_pose, states),
+                )
             base_translation, base_rotation, waypoint_gripper = self.waypoint_model(
                 last_hidden, anchor_pose, tau, attention_mask
             )
@@ -307,9 +501,6 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 keep = (torch.rand(batch) >= self.memory_config.history_dropout).tolist()
                 event_lists = [events if kept else [] for events, kept in zip(event_lists, keep)]
             episode_ids = [example.get("memory_episode_id") for example in examples]
-            event_tokens, event_valid, event_starts, event_ends = self._encode_event_lists(
-                event_lists, device, train=train, episode_ids=episode_ids
-            )
             query_steps = []
             for index, (example, events) in enumerate(zip(examples, event_lists)):
                 contract = example.get("memory_contract")
@@ -328,6 +519,16 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
                 if any(int(event["start_step"]) >= query_step or int(event["end_step"]) > query_step for event in events):
                     raise ValueError(f"Sample {index} includes a current/future execution event")
                 query_steps.append(query_step)
+            visual_lookup = None
+            if self.memory_visual_source == "qwen":
+                visual_lookup = self._qwen_visual_lookup(
+                    examples, event_lists, episode_ids, visual, query_steps, train=train
+                )
+            event_tokens, event_valid, event_starts, event_ends = self._encode_event_lists(
+                event_lists, device, train=train, episode_ids=episode_ids, visual_lookup=visual_lookup
+            )
+            if visual_lookup is not None and not train:
+                self._prune_eval_visual_cache(episode_ids, query_steps)
             query_steps = torch.as_tensor(query_steps, device=device, dtype=torch.long).view(batch, 1).expand(
                 -1, len(self.waypoint_tau) + self.action_horizon
             )
@@ -428,9 +629,8 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             else bc_loss.new_zeros(())
         )
         total_loss = bc_loss + self.waypoint_weight * waypoint_loss + self.gripper_weight * gripper_loss
-        residual_ratio = spatial_residual.detach().float().square().mean().sqrt() / (
-            action_queries.detach().float().square().mean().sqrt() + 1e-8
-        )
+        query_scale = action_queries.detach().float().square().mean().sqrt() + 1e-8
+        residual_ratio = spatial_residual.detach().float().square().mean().sqrt() / query_scale
         return {
             "total_loss": total_loss,
             "action_loss": bc_loss,
@@ -443,20 +643,32 @@ class QwenSpatialMemOFT(QwenSpatialOFT):
             "spatial_gate_mean": spatial_gates.float().mean(),
             "spatial_gate_std": spatial_gates.float().std(unbiased=False),
             "memory_events_visible": allowed.sum(dim=-1).float().mean(),
+            # How much memory and the bridge actually move the action queries.
+            "memory_residual_ratio": action_residual.detach().float().square().mean().sqrt() / query_scale,
+            "waypoint_twist_norm": twist.detach().float().norm(dim=-1).mean(),
+            **(
+                {"bridge_residual_ratio": bridge_residual.detach().float().square().mean().sqrt() / query_scale}
+                if bridge_residual is not None
+                else {}
+            ),
         }
 
     def forward(self, examples: list[dict] = None, **kwargs):
         if not isinstance(examples, list):
             examples = [examples]
-        qwen_inputs, hidden, visual = self._build_inputs_with_visual(examples)
-        return self._predict_from_features(examples, qwen_inputs, hidden, visual, train=True)
+        qwen_inputs, hidden, visual, layer_features = self._build_inputs_with_visual(examples)
+        return self._predict_from_features(
+            examples, qwen_inputs, hidden, visual, train=True, layer_features=layer_features
+        )
 
     @torch.inference_mode()
     def predict_action(self, examples: list[dict] = None, **kwargs):
         if not isinstance(examples, list):
             examples = [examples]
-        qwen_inputs, hidden, visual = self._build_inputs_with_visual(examples)
-        actions, _, _, _ = self._predict_from_features(examples, qwen_inputs, hidden, visual, train=False)
+        qwen_inputs, hidden, visual, layer_features = self._build_inputs_with_visual(examples)
+        actions, _, _, _ = self._predict_from_features(
+            examples, qwen_inputs, hidden, visual, train=False, layer_features=layer_features
+        )
         return {"normalized_actions": actions.detach().float().cpu().numpy()}
 
 

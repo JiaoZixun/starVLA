@@ -188,7 +188,10 @@ class PolicyModel:
         # Same causal 8-step execution-event lifecycle as the standard LIBERO
         # client and the training dataset (starVLA.dataloader.memory_v2).
         self.memory_buffer = (
-            LiberoExecutionEventBuffer(capacity=int(self.vla.memory_config.capacity_events))
+            LiberoExecutionEventBuffer(
+                capacity=int(self.vla.memory_config.capacity_events),
+                include_visual=getattr(self.vla, "memory_visual_source", "rgb") == "rgb",
+            )
             if self.memory_enabled
             else None
         )

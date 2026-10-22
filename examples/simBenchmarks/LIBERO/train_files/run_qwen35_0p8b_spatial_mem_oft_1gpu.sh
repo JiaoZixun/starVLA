@@ -29,6 +29,8 @@ RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_libero_50k"
 STAGE_A_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_a.yaml"
 STAGE_B_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_stage_b.yaml"
 FULL_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_full.yaml"
+V3_CONFIG="examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_v3.yaml"
+QWEN_VISUAL_ROOT="${QWEN_VISUAL_ROOT:-playground/DerivedData/libero_qwen_visual_v1}"
 QWEN35_REVISION="${QWEN35_REVISION:-2fc06364715b967f1860aea9cf38778875588b17}"
 HF_HOME="${HF_HOME:-/data1/jiaozx/.cache/huggingface}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
@@ -45,7 +47,8 @@ nvidia-smi -i "${GPU_ID}" --query-gpu=index --format=csv,noheader,nounits >/dev/
 case "${STAGE}" in
   a|b|all) ;;
   full) RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k" ;;
-  *) fail "STAGE must be a, b, all, or full." ;;
+  v3) RUN_DIR="${RUN_DIR_OVERRIDE:-playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k}" ;;
+  *) fail "STAGE must be a, b, all, full, or v3." ;;
 esac
 
 # A measured full-unfreeze batch of 32 peaks near 30.3 GiB with AdamW state.
@@ -147,12 +150,45 @@ for dataset in \
         fail "Spatial pose sidecar missing for ${dataset}."
 done
 
+EXTRA_TRAIN_ARGS=()
+if [[ "${STAGE}" == v3 ]]; then
+    # One fingerprint for all four sidecars: the frozen vision tower that
+    # training and eval also run (the model re-checks it at the first step).
+    VISUAL_FINGERPRINT="$("${PYTHON}" - "${QWEN_VISUAL_ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+names = ["libero_spatial_no_noops_1.0.0_lerobot", "libero_object_no_noops_1.0.0_lerobot",
+         "libero_goal_no_noops_1.0.0_lerobot", "libero_10_no_noops_1.0.0_lerobot"]
+prints = set()
+for name in names:
+    manifest = root / name / "manifest.json"
+    if not manifest.is_file() or not (root / name / "obs_qwen_pooled.npy").is_file():
+        raise SystemExit(f"Qwen visual sidecar missing: {root / name}; run prepare_qwen_visual_sidecar.py")
+    prints.add(json.loads(manifest.read_text())["visual_fingerprint"])
+if len(prints) != 1:
+    raise SystemExit(f"Qwen visual sidecars disagree on the vision tower: {sorted(prints)}")
+print(prints.pop())
+PY
+)" || fail "Qwen visual sidecar check failed."
+    echo "Qwen visual sidecar fingerprint: ${VISUAL_FINGERPRINT}"
+    # Warm the page cache: training reads random frames of the ~18 GB sidecar.
+    cat "${QWEN_VISUAL_ROOT}"/*/obs_qwen_pooled.npy > /dev/null
+    EXTRA_TRAIN_ARGS+=(--framework.memory.visual_fingerprint "${VISUAL_FINGERPRINT}")
+fi
+# Optional space-separated dotlist overrides, e.g. for a short smoke run.
+if [[ -n "${TRAIN_OVERRIDES:-}" ]]; then
+    read -r -a overrides <<< "${TRAIN_OVERRIDES}"
+    EXTRA_TRAIN_ARGS+=("${overrides[@]}")
+fi
+
 run_train() {
     local config_yaml="$1"
     "${PYTHON}" starVLA/training/train_starvla.py \
         --config_yaml "${config_yaml}" \
         --framework.qwenvl.local_model_path "${QWEN35_MODEL_DIR}" \
-        --framework.qwenvl.local_files_only true
+        --framework.qwenvl.local_files_only true \
+        "${EXTRA_TRAIN_ARGS[@]}"
 }
 
 run_stage() {
@@ -174,6 +210,11 @@ fi
 if [[ "${STAGE}" == full ]]; then
     echo "=== Starting single-stage full training (Spatial 50k init, 50 000 steps, batch 32) on GPU ${GPU_ID} ==="
     run_train "${FULL_CONFIG}"
+fi
+
+if [[ "${STAGE}" == v3 ]]; then
+    echo "=== Starting v3 (bridge + Qwen visual memory; Spatial 50k init, 50 000 steps, batch 32) on GPU ${GPU_ID} ==="
+    run_train "${V3_CONFIG}"
 fi
 
 if [[ "${STAGE}" == b || "${STAGE}" == all ]]; then

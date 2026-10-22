@@ -12,6 +12,9 @@ from starVLA.dataloader.memory_v2 import (
     ACTION_HORIZON,
     MEMORY_CAPACITY_EVENTS,
     MEMORY_STRIDE,
+    QWEN_VISUAL_FEATURE_DIM,
+    QWEN_VISUAL_SIDECAR_FILE,
+    QWEN_VISUAL_SIDECAR_FORMAT,
     build_execution_event,
 )
 
@@ -31,6 +34,8 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         memory_capacity_events: int = MEMORY_CAPACITY_EVENTS,
         memory_decision_stride_env_steps: int = MEMORY_STRIDE,
         memory_aligned_anchors_only: bool = True,
+        memory_visual_source: str = "rgb",
+        qwen_visual_sidecar_root: str | Path | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -94,6 +99,42 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         self._memory_visual_memmap = visual
         self._memory_active_sample: tuple[int, int] | None = None
 
+        self.memory_visual_source = str(memory_visual_source)
+        self._qwen_visual_memmap = None
+        self.qwen_visual_fingerprint = None
+        if self.memory_visual_source == "qwen":
+            self._load_qwen_visual_sidecar(qwen_visual_sidecar_root, expected_offset)
+        elif self.memory_visual_source != "rgb":
+            raise ValueError(f"memory_visual_source must be rgb or qwen, got {self.memory_visual_source!r}")
+
+    def _load_qwen_visual_sidecar(self, root: str | Path | None, total_frames: int) -> None:
+        if not root:
+            raise ValueError("memory_visual_source=qwen requires qwen_visual_sidecar_root")
+        directory = Path(root) / self.dataset_name
+        manifest_path = directory / "manifest.json"
+        features_path = directory / QWEN_VISUAL_SIDECAR_FILE
+        if not manifest_path.is_file() or not features_path.is_file():
+            raise FileNotFoundError(
+                f"Qwen visual sidecar missing for {self.dataset_name}: {directory}; run prepare_qwen_visual_sidecar.py"
+            )
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("format") != QWEN_VISUAL_SIDECAR_FORMAT or manifest.get("dataset_name") != self.dataset_name:
+            raise ValueError(f"Unsupported Qwen visual sidecar for {self.dataset_name}: {manifest_path}")
+        if manifest.get("dataset_revision") != self.memory_manifest.get("dataset_revision"):
+            raise ValueError("Qwen visual sidecar revision differs from the memv2 sidecar")
+        offsets = {int(k): (int(v["offset"]), int(v["length"])) for k, v in manifest["episode_index_to_sidecar_range"].items()}
+        if offsets != self._memory_offsets:
+            raise ValueError("Qwen visual sidecar frame mapping differs from the memv2 sidecar")
+        features = np.load(features_path, mmap_mode="r", allow_pickle=False)
+        expected = (total_frames, 2, 16, QWEN_VISUAL_FEATURE_DIM)
+        if features.shape != expected or features.dtype != np.float16:
+            raise ValueError(f"Invalid Qwen visual sidecar {features.shape}/{features.dtype}; expected {expected}/float16")
+        fingerprint = manifest.get("visual_fingerprint")
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            raise ValueError("Qwen visual sidecar manifest lacks a vision-tower fingerprint")
+        self._qwen_visual_memmap = features
+        self.qwen_visual_fingerprint = fingerprint
+
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         self._memory_active_sample = (int(trajectory_id), int(base_index))
         return super().get_step_data(trajectory_id, base_index)
@@ -134,12 +175,20 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
         poses = self._get_geometry_pose_memmap()
         current_pose = np.asarray(poses[offset + frame_index], dtype=np.float32)
         initial_pose = np.asarray(poses[offset], dtype=np.float32)
-        current_visual = np.asarray(self._memory_visual_memmap[offset + frame_index], dtype=np.float32) / 255.0
-        sample["memory_visual_tokens"] = current_visual
+        qwen_mode = self.memory_visual_source == "qwen"
+        if not qwen_mode:
+            current_visual = np.asarray(self._memory_visual_memmap[offset + frame_index], dtype=np.float32) / 255.0
+            sample["memory_visual_tokens"] = current_visual
         sample["env_step"] = int(frame_index)
 
         completed = frame_index // stride
         first_event = max(0, completed - self.memory_capacity_events)
+        if qwen_mode and completed > first_event:
+            # One fp16 frame per event boundary, shared by adjacent events;
+            # the model looks visuals up by step exactly as eval does.
+            boundaries = phase + stride * np.arange(first_event, completed + 1)
+            sample["memory_visual_bank_steps"] = boundaries.astype(np.int64)
+            sample["memory_visual_bank"] = np.asarray(self._qwen_visual_memmap[offset + boundaries])
         events = []
         for event_index in range(first_event, completed):
             start = phase + event_index * stride
@@ -153,8 +202,8 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
             event = build_execution_event(
                 start_step=start,
                 end_step=end,
-                visual_start=np.asarray(self._memory_visual_memmap[offset + start], dtype=np.float32) / 255.0,
-                visual_end=np.asarray(self._memory_visual_memmap[offset + end], dtype=np.float32) / 255.0,
+                visual_start=None if qwen_mode else np.asarray(self._memory_visual_memmap[offset + start], dtype=np.float32) / 255.0,
+                visual_end=None if qwen_mode else np.asarray(self._memory_visual_memmap[offset + end], dtype=np.float32) / 255.0,
                 state_start=event_states[0],
                 state_end=np.asarray(self.curr_traj_data.iloc[end]["observation.state"], dtype=np.float32),
                 executed_actions=event_actions,
@@ -174,6 +223,8 @@ class ExecutionEventLeRobotDataset(SpatialLeRobotSingleDataset):
             "event_action_source": "raw_source_action_rows_with_eval_gripper_mapping",
             "event_interval": "[start_step,end_step), end_step <= source_frame_index",
         }
+        if qwen_mode:
+            sample["memory_contract"]["visual_fingerprint"] = self.qwen_visual_fingerprint
         # Keep the same absolute measured pose contract used by eval.
         sample["geometry_current"]["eef_pose"] = current_pose
         return sample
