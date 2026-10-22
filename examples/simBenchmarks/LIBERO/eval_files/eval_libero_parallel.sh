@@ -9,7 +9,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 Single-GPU LIBERO evaluation with parallel simulation workers and dynamic inference batching.
 Run: GPU_ID=1 SIM_WORKERS=8 INFERENCE_BATCH_SIZE=4 bash examples/simBenchmarks/LIBERO/eval_files/eval_libero_parallel.sh
 
-Variables: GPU_ID (single GPU, default auto), SIM_WORKERS (4 or 8; multiple of 4),
+Variables: GPU_ID (single GPU, default auto), SIM_WORKERS (multiple of 4; 40 gives one
+worker per task), NUM_SERVERS (policy servers on the same GPU, ports PORT..PORT+N-1;
+workers are assigned round-robin; default 1),
 INFERENCE_BATCH_SIZE (default 4), INFERENCE_BATCH_WAIT_MS (default 12),
 NUM_TRIALS_PER_TASK (default 50), MAX_TASKS (default -1), SAVE_VIDEOS (default 0).
 TASK_SUITES_CSV selects suites (default: libero_spatial,libero_object,libero_goal,libero_10).
@@ -44,6 +46,7 @@ MIN_FREE_GPU_MEM_MIB="${MIN_FREE_GPU_MEM_MIB:-16000}"
 SIM_WORKERS="${SIM_WORKERS:-8}"
 INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-4}"
 INFERENCE_BATCH_WAIT_MS="${INFERENCE_BATCH_WAIT_MS:-12}"
+NUM_SERVERS="${NUM_SERVERS:-1}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-50}"
 MAX_TASKS="${MAX_TASKS:--1}"
 SAVE_VIDEOS="${SAVE_VIDEOS:-0}"
@@ -97,6 +100,10 @@ if [[ ! -d "${LIBERO_HOME}/libero" ]]; then
 fi
 if [[ ! "${SIM_WORKERS}" =~ ^[1-9][0-9]*$ ]] || (( SIM_WORKERS % 4 != 0 )); then
   echo "SIM_WORKERS must be a positive multiple of 4 (for example 4 or 8); got '${SIM_WORKERS}'." >&2
+  exit 2
+fi
+if [[ ! "${NUM_SERVERS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "NUM_SERVERS must be a positive integer; got '${NUM_SERVERS}'." >&2
   exit 2
 fi
 if [[ ! "${INFERENCE_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
@@ -153,7 +160,7 @@ elif ! checkpoint_ready; then
 fi
 
 echo "Checkpoint ready: ${CKPT} ($(stat -c '%s' "${CKPT}") bytes)"
-echo "Using GPU ${GPU_ID}: one policy server, ${SIM_WORKERS} simulator workers, inference batch ${INFERENCE_BATCH_SIZE}."
+echo "Using GPU ${GPU_ID}: ${NUM_SERVERS} policy server(s), ${SIM_WORKERS} simulator workers, inference batch ${INFERENCE_BATCH_SIZE}."
 if [[ -n "${CPU_AFFINITY_START}" || -n "${CPU_AFFINITY_COUNT}" ]]; then
   if [[ ! "${CPU_AFFINITY_START}" =~ ^[0-9]+$ || ! "${CPU_AFFINITY_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Set both CPU_AFFINITY_START and positive CPU_AFFINITY_COUNT to pin simulator workers." >&2
@@ -231,9 +238,8 @@ fi
 
 LOG_DIR="${RUN_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
-SERVER_LOG="${LOG_DIR}/server_gpu${GPU_ID}.log"
 WORKER_PIDS=()
-SERVER_PID=""
+SERVER_PIDS=()
 CLEANED_UP=0
 
 cleanup() {
@@ -242,7 +248,7 @@ cleanup() {
   CLEANED_UP=1
   trap - EXIT INT TERM
   for pid in "${WORKER_PIDS[@]:-}"; do kill "${pid}" 2>/dev/null || true; done
-  if [[ -n "${SERVER_PID}" ]]; then kill "${SERVER_PID}" 2>/dev/null || true; fi
+  for pid in "${SERVER_PIDS[@]:-}"; do kill "${pid}" 2>/dev/null || true; done
   wait 2>/dev/null || true
   return "${status}"
 }
@@ -259,32 +265,50 @@ fi
 if [[ -n "${CONFIG_OVERRIDE_LOAD_BASE_WEIGHTS}" ]]; then
   server_overrides+=(--config_override "framework.qwenvl.load_base_weights=${CONFIG_OVERRIDE_LOAD_BASE_WEIGHTS}")
 fi
-env CUDA_VISIBLE_DEVICES="${GPU_ID}" "${server_prefix[@]}" "${PYTHON}" deployment/model_server/server_policy.py \
-  --ckpt_path "${CKPT}" --port "${PORT}" --use_bf16 \
-  --max_inference_batch_size "${INFERENCE_BATCH_SIZE}" \
-  --inference_batch_wait_ms "${INFERENCE_BATCH_WAIT_MS}" \
-  "${server_overrides[@]}" \
-  >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-server_ready=0
-for ((elapsed = 0; elapsed < SERVER_STARTUP_WAIT; elapsed += 2)); do
-  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "Policy server exited; see ${SERVER_LOG}" >&2
-    tail -n 50 "${SERVER_LOG}" >&2 || true
+# Each server loads the same checkpoint and batches only its own workers'
+# requests; server s listens on PORT+s (server 0 keeps the single-server log name).
+server_log_for() {
+  if (( NUM_SERVERS == 1 )); then echo "${LOG_DIR}/server_gpu${GPU_ID}.log"
+  else echo "${LOG_DIR}/server_gpu${GPU_ID}_port$((PORT + $1)).log"; fi
+}
+# Readiness below is a plain TCP connect, so a server left on the port by
+# another run would be mistaken for ours and evaluate the wrong checkpoint.
+for ((s = 0; s < NUM_SERVERS; s++)); do
+  if "${PYTHON}" -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', $((PORT + s)))); s.close()" >/dev/null 2>&1; then
+    echo "Port $((PORT + s)) is already in use by another process; set PORT to a free port." >&2
     exit 1
   fi
-  if "${PYTHON}" -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', ${PORT})); s.close()" >/dev/null 2>&1; then
-    server_ready=1
-    break
-  fi
-  sleep 2
 done
-if [[ "${server_ready}" != "1" ]]; then
-  echo "Timed out waiting for policy server; see ${SERVER_LOG}" >&2
-  exit 1
-fi
-echo "Policy server ready on GPU ${GPU_ID}, port ${PORT}."
+for ((s = 0; s < NUM_SERVERS; s++)); do
+  env CUDA_VISIBLE_DEVICES="${GPU_ID}" "${server_prefix[@]}" "${PYTHON}" deployment/model_server/server_policy.py \
+    --ckpt_path "${CKPT}" --port "$((PORT + s))" --use_bf16 \
+    --max_inference_batch_size "${INFERENCE_BATCH_SIZE}" \
+    --inference_batch_wait_ms "${INFERENCE_BATCH_WAIT_MS}" \
+    "${server_overrides[@]}" \
+    >"$(server_log_for "${s}")" 2>&1 &
+  SERVER_PIDS+=("$!")
+done
+
+for ((s = 0; s < NUM_SERVERS; s++)); do
+  server_ready=0
+  for ((elapsed = 0; elapsed < SERVER_STARTUP_WAIT; elapsed += 2)); do
+    if ! kill -0 "${SERVER_PIDS[s]}" 2>/dev/null; then
+      echo "Policy server exited; see $(server_log_for "${s}")" >&2
+      tail -n 50 "$(server_log_for "${s}")" >&2 || true
+      exit 1
+    fi
+    if "${PYTHON}" -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', $((PORT + s)))); s.close()" >/dev/null 2>&1; then
+      server_ready=1
+      break
+    fi
+    sleep 2
+  done
+  if [[ "${server_ready}" != "1" ]]; then
+    echo "Timed out waiting for policy server; see $(server_log_for "${s}")" >&2
+    exit 1
+  fi
+  echo "Policy server ready on GPU ${GPU_ID}, port $((PORT + s))."
+done
 
 if (( MAX_TASKS > 0 )); then EVAL_TASKS="${MAX_TASKS}"; else EVAL_TASKS=10; fi
 SHARDS_PER_SUITE=$((SIM_WORKERS / ${#TASK_SUITES[@]}))
@@ -306,9 +330,10 @@ for suite in "${TASK_SUITES[@]}"; do
       worker_cpu=$((CPU_AFFINITY_START + worker_index % CPU_AFFINITY_COUNT))
       worker_prefix=(taskset -c "${worker_cpu}")
     fi
-    echo "Launching worker ${worker_index}: ${suite} tasks [${task_start}, ${task_end}) on GPU ${GPU_ID}${worker_cpu:+, CPU ${worker_cpu}}"
+    worker_port=$((PORT + worker_index % NUM_SERVERS))
+    echo "Launching worker ${worker_index}: ${suite} tasks [${task_start}, ${task_end}) on GPU ${GPU_ID}, port ${worker_port}${worker_cpu:+, CPU ${worker_cpu}}"
     env CUDA_VISIBLE_DEVICES="${GPU_ID}" "${worker_prefix[@]}" "${PYTHON}" examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
-      --args.pretrained-path "${CKPT}" --args.host 127.0.0.1 --args.port "${PORT}" \
+      --args.pretrained-path "${CKPT}" --args.host 127.0.0.1 --args.port "${worker_port}" \
       --args.task-suite-name "${suite}" --args.num-trials-per-task "${NUM_TRIALS_PER_TASK}" \
       --args.max-tasks "${MAX_TASKS}" --args.task-id-start "${task_start}" \
       --args.task-id-end "${task_end}" --args.seed "${SEED}" --args.unnorm-key "${UNNORM_KEY}" \
