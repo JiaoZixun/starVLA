@@ -85,7 +85,8 @@ v3 更快，因为冻结视觉塔后不再对它做反向传播。bridge 和 102
 - 配置：`examples/simBenchmarks/LIBERO/train_files/qwen35_0p8b_spatial_mem_oft_v3.yaml`
   - Spatial 50k 初始化（strict reload），训练 50k 步，batch 32，学习率与 v2 相同；`proprio_layer_bridge` 的学习率为 1e-4。
   - `freeze_modules: qwen_vl_interface.model.model.visual`
-- 运行目录：`playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k`
+- 数据配比：mixture `libero_spatial_mem_oft_long2x`，Spatial:Object:Goal:Long = 1:1:1:2（采样概率，不按数据集长度缩放），LIBERO-10 占每个 batch 的 40%（原 `libero_spatial_mem_oft_all` 为各 25%）。
+- 运行目录：`playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v3_long2x_libero_50k`
 
 ```bash
 # 生成 sidecar（约 40 分钟，单卡）

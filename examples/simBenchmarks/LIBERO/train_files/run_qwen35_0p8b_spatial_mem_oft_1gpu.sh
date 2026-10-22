@@ -47,7 +47,7 @@ nvidia-smi -i "${GPU_ID}" --query-gpu=index --format=csv,noheader,nounits >/dev/
 case "${STAGE}" in
   a|b|all) ;;
   full) RUN_DIR="playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k" ;;
-  v3) RUN_DIR="${RUN_DIR_OVERRIDE:-playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k}" ;;
+  v3) RUN_DIR="${RUN_DIR_OVERRIDE:-playground/Checkpoints/qwen35_0p8b_spatial_mem_oft_v3_long2x_libero_50k}" ;;
   *) fail "STAGE must be a, b, all, full, or v3." ;;
 esac
 

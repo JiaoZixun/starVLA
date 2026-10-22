@@ -1,4 +1,4 @@
-run_id: qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k
+run_id: qwen35_0p8b_spatial_mem_oft_v3_long2x_libero_50k
 run_root_dir: playground/Checkpoints
 seed: 42
 is_debug: false
@@ -71,7 +71,8 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
-    data_mix: libero_spatial_mem_oft_all
+    # Spatial:Object:Goal:Long = 1:1:1:2 sampling probability.
+    data_mix: libero_spatial_mem_oft_long2x
     geometry_sidecar_root: playground/DerivedData/libero_spatial_oft_v1
     memory_sidecar_root: playground/DerivedData/libero_spatial_mem_v2
     memory_visual_source: qwen

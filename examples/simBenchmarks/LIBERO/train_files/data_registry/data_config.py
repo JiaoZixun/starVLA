@@ -187,6 +187,14 @@ DATASET_NAMED_MIXTURES = {
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
     ],
+    # Spatial:Object:Goal:Long = 1:1:1:2 sampling probability (weights are not
+    # scaled by dataset length), so LIBERO-10 supplies 40% of each batch.
+    "libero_spatial_mem_oft_long2x": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_mem_oft_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 2.0, "libero_spatial_mem_oft_franka"),
+    ],
     "libero_goal": [
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
     ],

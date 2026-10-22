@@ -37,7 +37,7 @@ TRAIN_STAGE="${TRAIN_STAGE:-full}"
 RUN_LIBERO_PLUS="${RUN_LIBERO_PLUS:-1}"
 case "${TRAIN_STAGE}" in
   full) RUN_ID="qwen35_0p8b_spatial_mem_oft_v2_full_libero_50k" ;;
-  v3) RUN_ID="qwen35_0p8b_spatial_mem_oft_v3_bridge_qwenvis_libero_50k" ;;
+  v3) RUN_ID="qwen35_0p8b_spatial_mem_oft_v3_long2x_libero_50k" ;;
   *) echo "TRAIN_STAGE must be full or v3" >&2; exit 1 ;;
 esac
 RUN_DIR="${STARVLA_DIR}/playground/Checkpoints/${RUN_ID}"
