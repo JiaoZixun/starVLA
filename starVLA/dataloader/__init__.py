@@ -33,33 +33,50 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 
 
+def _build_human_wrist_dataloader(data_cfg, waypoint_tau):
+    import torch
+    from starVLA.dataloader.human_wrist_dataset import HumanWristGeometryDataset, collate_human_wrist_batch
+
+    dataset = HumanWristGeometryDataset(
+        sidecar_root=data_cfg.geometry_sidecar_root,
+        split=data_cfg.get("split", "train"),
+        waypoint_tau=waypoint_tau,
+        image_size=data_cfg.get("image_size", 224),
+    )
+    workers = int(data_cfg.get("num_workers", 8))
+    kwargs = {
+        "batch_size": int(data_cfg.per_device_batch_size),
+        "collate_fn": collate_human_wrist_batch,
+        "num_workers": workers,
+        "pin_memory": bool(data_cfg.get("pin_memory", True)),
+        "shuffle": True,
+        "drop_last": bool(data_cfg.get("drop_last", False)),
+        "generator": torch.Generator(),
+    }
+    if workers:
+        kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 2))
+    return DataLoader(dataset, **kwargs)
+
+
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
     if dataset_py == "human_wrist_dataset":
-        import torch
-        from starVLA.dataloader.human_wrist_dataset import HumanWristGeometryDataset, collate_human_wrist_batch
+        data_cfg = cfg.datasets.vla_data
+        return _build_human_wrist_dataloader(data_cfg, data_cfg.get("waypoint_tau", [1, 2, 4, 8]))
+    elif dataset_py == "cotrain_human_robot":
+        # Robot batches come from the regular LeRobot mixture configured in vla_data;
+        # human batches from vla_data.human_data, interleaved one domain per batch.
+        from starVLA.dataloader.cotrain_dataloader import HumanRobotCotrainLoader
 
         data_cfg = cfg.datasets.vla_data
-        dataset = HumanWristGeometryDataset(
-            sidecar_root=data_cfg.geometry_sidecar_root,
-            split=data_cfg.get("split", "train"),
-            waypoint_tau=data_cfg.get("waypoint_tau", [1, 2, 4, 8]),
-            image_size=data_cfg.get("image_size", 224),
-        )
-        workers = int(data_cfg.get("num_workers", 8))
-        kwargs = {
-            "batch_size": int(data_cfg.per_device_batch_size),
-            "collate_fn": collate_human_wrist_batch,
-            "num_workers": workers,
-            "pin_memory": bool(data_cfg.get("pin_memory", True)),
-            "shuffle": True,
-            "drop_last": bool(data_cfg.get("drop_last", False)),
-            "generator": torch.Generator(),
-        }
-        if workers:
-            kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
-            kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 2))
-        return DataLoader(dataset, **kwargs)
+        human_cfg = data_cfg.get("human_data")
+        if human_cfg is None:
+            raise ValueError("dataset_py=cotrain_human_robot requires datasets.vla_data.human_data")
+        robot_loader = build_dataloader(cfg, dataset_py="lerobot_datasets")
+        # Both domains must use the same waypoint slots as the model.
+        human_loader = _build_human_wrist_dataloader(human_cfg, data_cfg.get("waypoint_tau", [1, 2, 4, 8]))
+        return HumanRobotCotrainLoader(robot_loader, human_loader, human_every=int(human_cfg.get("human_every", 4)))
     elif dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data

@@ -108,10 +108,12 @@ class SpatialLibero4in1DataConfig(Libero4in1DataConfig):
         sidecar_root = data_cfg.get("geometry_sidecar_root")
         if not sidecar_root:
             raise ValueError("Spatial LIBERO training requires datasets.vla_data.geometry_sidecar_root")
+        phase_window = data_cfg.get("phase_window_frames", None) if data_cfg.get("phase_labels", False) else None
         return SpatialLeRobotSingleDataset(
             **kwargs,
             geometry_sidecar_root=sidecar_root,
             waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 4, 8, 16])),
+            phase_window_frames=None if phase_window is None else int(phase_window),
         )
 
 

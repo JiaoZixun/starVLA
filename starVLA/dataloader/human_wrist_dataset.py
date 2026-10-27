@@ -1,8 +1,11 @@
 """DexYCB wrist-geometry dataset with the same sample contract as the LIBERO geometry loader.
 
-Sidecars come from ``examples/human2robots/DexYCBSpatial/prepare_dexycb_keypoints.py``:
+Sidecars come from ``examples/human2robots/DexYCBSpatial/prepare_dexycb_keypoints.py`` (v1) or
+``prepare_dexycb_cotrain.py`` (v2):
 ``current_pose`` [N,4,4] (table frame, Panda grip_site axis convention),
 ``relative_waypoints`` [N,K,4,4] = R_t^T R_f / R_t^T (p_f - p_t), ``future_valid`` [N,K].
+v2 adds per-sequence language in ``samples.jsonl`` and, when present,
+``future_phase`` [N,K] (+ ``future_phase_valid``) and ``future_object`` [N,K,3] (+ ``future_object_valid``).
 """
 
 from __future__ import annotations
@@ -13,6 +16,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
+
+# Optional v2 label arrays: (label key, valid key, trailing shape after [N,K]).
+OPTIONAL_SLOT_LABELS = (
+    ("future_phase", "future_phase_valid", ()),
+    ("future_object", "future_object_valid", (3,)),
+)
 
 
 def collate_human_wrist_batch(batch):
@@ -32,6 +41,15 @@ class HumanWristGeometryDataset(Dataset):
         count, k = len(self.records), len(metadata["tau_slots"])
         if (self.current_pose.shape, self.relative_waypoints.shape, self.future_valid.shape) != ((count, 4, 4), (count, k, 4, 4), (count, k)):
             raise ValueError(f"Inconsistent human sidecar arrays in {self.split_dir}")
+        self.optional_labels = {}
+        for key, valid_key, trailing in OPTIONAL_SLOT_LABELS:
+            if not (self.split_dir / f"{key}.npy").is_file():
+                continue
+            values = np.load(self.split_dir / f"{key}.npy", mmap_mode="r")
+            valid = np.load(self.split_dir / f"{valid_key}.npy", mmap_mode="r")
+            if values.shape != (count, k, *trailing) or valid.shape != (count, k):
+                raise ValueError(f"Inconsistent {key} sidecar arrays in {self.split_dir}")
+            self.optional_labels[key] = (valid_key, values, valid)
         self.image_size = (int(image_size), int(image_size)) if np.isscalar(image_size) else tuple(image_size)
 
     def __len__(self):
@@ -42,15 +60,19 @@ class HumanWristGeometryDataset(Dataset):
         with Image.open(record["image"]) as image:
             # Same resize as the LIBERO loader (_pack_sample: Image.resize(image_size)).
             image = image.convert("RGB").resize(self.image_size)
+        labels = {
+            "relative_waypoints": np.asarray(self.relative_waypoints[index], dtype=np.float32).copy(),
+            "future_valid": np.asarray(self.future_valid[index], dtype=np.bool_).copy(),
+        }
+        for key, (valid_key, values, valid) in self.optional_labels.items():
+            labels[key] = np.asarray(values[index]).copy()
+            labels[valid_key] = np.asarray(valid[index], dtype=np.bool_).copy()
         return {
             "domain": "human",
             "image": [image],
             "lang": record["lang"],
             "geometry_current": {"eef_pose": np.asarray(self.current_pose[index], dtype=np.float32).copy()},
-            "geometry_labels": {
-                "relative_waypoints": np.asarray(self.relative_waypoints[index], dtype=np.float32).copy(),
-                "future_valid": np.asarray(self.future_valid[index], dtype=np.bool_).copy(),
-            },
+            "geometry_labels": labels,
             "sequence_id": record["sequence_id"],
             "frame_index": int(record["frame_index"]),
         }

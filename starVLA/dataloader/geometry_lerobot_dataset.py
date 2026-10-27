@@ -8,13 +8,19 @@ from pathlib import Path
 import numpy as np
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
+from starVLA.dataloader.phase_labels import phases_from_holding, robot_holding_from_gripper_action, slot_phases
 
 
 class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
     """Attach geometry labels by (dataset, revision, episode, frame) only."""
 
-    def __init__(self, *args, geometry_sidecar_root: str | Path, waypoint_tau=(1, 4, 8, 16), **kwargs):
+    def __init__(
+        self, *args, geometry_sidecar_root: str | Path, waypoint_tau=(1, 4, 8, 16), phase_window_frames: int | None = None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
+        # None disables phase labels (default); otherwise the grasp/release window in frames.
+        self.phase_window_frames = None if phase_window_frames is None else int(phase_window_frames)
+        self._phase_cache: tuple[int, np.ndarray] | None = None
         self.waypoint_tau = tuple(int(value) for value in waypoint_tau)
         if not self.waypoint_tau or min(self.waypoint_tau) < 1 or tuple(sorted(set(self.waypoint_tau))) != self.waypoint_tau:
             raise ValueError(f"waypoint_tau must be strictly increasing positive offsets, got {self.waypoint_tau}")
@@ -149,4 +155,21 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
             "future_gripper_valid": future_gripper_valid,
             "source_frame_index": np.asarray(frame_index, dtype=np.int64),
         }
+        if self.phase_window_frames is not None:
+            future_phase, future_phase_valid = slot_phases(self._episode_phases(episode_index, trajectory), future_indices)
+            sample["geometry_labels"]["future_phase"] = future_phase
+            sample["geometry_labels"]["future_phase_valid"] = future_phase_valid
         return sample
+
+    def _episode_phases(self, episode_index: int, trajectory) -> np.ndarray:
+        """Per-frame phase ids of the active episode, from its commanded gripper (action[:, 6])."""
+        if self._phase_cache is not None and self._phase_cache[0] == episode_index:
+            return self._phase_cache[1]
+        if trajectory is None or "action" not in trajectory.columns:
+            raise ValueError(f"Phase labels need the action column of {self.dataset_name} episode {episode_index}")
+        actions = np.stack(trajectory["action"].to_numpy()).astype(np.float64)
+        if actions.ndim != 2 or actions.shape[1] != 7:
+            raise ValueError(f"Expected LIBERO actions [T,7] for phase labels, got {actions.shape}")
+        phase = phases_from_holding(robot_holding_from_gripper_action(actions[:, 6]), self.phase_window_frames)
+        self._phase_cache = (episode_index, phase)
+        return phase

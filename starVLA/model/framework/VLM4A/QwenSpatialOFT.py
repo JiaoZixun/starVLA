@@ -92,14 +92,44 @@ class BridgeAttentionBlock(nn.Module):
         return queries + self.ffn(self.ffn_norm(queries))
 
 
+ARM_ID = {"robot": 0, "human": 1}
+ANCHOR_MODES = ("absolute", "gravity")
+PHASES = ("approach", "grasp", "transport", "release")
+
+
+def anchor_features(anchor_pose: torch.Tensor, mode: str = "absolute") -> torch.Tensor:
+    """9-d anchor input [B,9] of the current end-effector pose.
+
+    ``absolute``: world position + rot6d (frame dependent).
+    ``gravity``: world -z expressed in the end-effector frame, R^T [0,0,-1], zero padded
+    to 9 so the projection keeps its shape. It encodes only the tilt, which is defined the
+    same way in any z-up world, and drops position and heading.
+    """
+    if mode == "absolute":
+        rotation_6d = matrix_to_rotation_6d(anchor_pose[..., :3, :3])
+        return torch.cat((anchor_pose[..., :3, 3].float(), rotation_6d), dim=-1)
+    if mode == "gravity":
+        # R^T @ [0,0,-1] is minus the third row of R.
+        gravity_local = -anchor_pose[..., 2, :3].float()
+        return torch.cat((gravity_local, gravity_local.new_zeros((*gravity_local.shape[:-1], 6))), dim=-1)
+    raise ValueError(f"anchor_mode must be one of {ANCHOR_MODES}, got {mode!r}")
+
+
 class WaypointModel(nn.Module):
     """Predict relative SE(3) waypoints from task-conditioned action-token features."""
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4, predict_gripper: bool = True, bridge_layers: int = 0):
+    def __init__(
+        self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4,
+        predict_gripper: bool = True, bridge_layers: int = 0, anchor_mode: str = "absolute", num_phases: int = 0,
+        predict_object: bool = False,
+    ):
         super().__init__()
         self.width = width
         self.predict_gripper = bool(predict_gripper)
         self.bridge = int(bridge_layers) > 0
+        if anchor_mode not in ANCHOR_MODES:
+            raise ValueError(f"anchor_mode must be one of {ANCHOR_MODES}, got {anchor_mode!r}")
+        self.anchor_mode = anchor_mode
         self.anchor_projection = nn.Sequential(nn.Linear(9, width), nn.GELU(), nn.Linear(width, width))
         self.arm_embedding = nn.Embedding(2, width)
         self.time_projection = nn.Sequential(nn.Linear(1, width), nn.GELU(), nn.Linear(width, width))
@@ -124,6 +154,22 @@ class WaypointModel(nn.Module):
             nn.init.zeros_(self.gripper_head.bias)
         with torch.no_grad():
             self.rotation_head.bias.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+        # Optional auxiliary heads on the per-slot features; absent unless enabled so
+        # checkpoints trained without them still load strictly.
+        self.num_phases = int(num_phases)
+        if self.num_phases:
+            self.phase_head = nn.Linear(width, self.num_phases)
+        if predict_object:
+            # Grasped-object centre in the current end-effector frame at each future slot, in 0.1 m units.
+            self.object_head = nn.Linear(width, 3)
+
+    def auxiliary_outputs(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        outputs = {}
+        if hasattr(self, "phase_head"):
+            outputs["phase_logits"] = self.phase_head(features)
+        if hasattr(self, "object_head"):
+            outputs["object_position"] = self.object_head(features) * 0.1
+        return outputs
 
     def forward(
         self,
@@ -133,17 +179,15 @@ class WaypointModel(nn.Module):
         memory_attention_mask: torch.Tensor | None = None,
         bridge_aq: list[torch.Tensor] | None = None,
         bridge_raw: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        arm_id: int = ARM_ID["robot"],
+        return_features: bool = False,
+    ):
+        """(translation, rotation_6d, gripper), plus the per-slot features [B,K,width] if requested."""
         batch_size = anchor_pose.shape[0]
-        rotation_6d = matrix_to_rotation_6d(anchor_pose[..., :3, :3])
-        anchor_features = torch.cat((anchor_pose[..., :3, 3].float(), rotation_6d), dim=-1)
         times = tau.float().view(1, -1, 1).expand(batch_size, -1, -1)
-        anchor_token = self.anchor_projection(anchor_features).unsqueeze(1)
-        query = (
-            anchor_token
-            + self.arm_embedding(torch.zeros((batch_size, 1), device=anchor_pose.device, dtype=torch.long))
-            + self.time_projection(times)
-        )
+        anchor_token = self.anchor_projection(anchor_features(anchor_pose, self.anchor_mode)).unsqueeze(1)
+        arm = torch.full((batch_size, 1), int(arm_id), device=anchor_pose.device, dtype=torch.long)
+        query = anchor_token + self.arm_embedding(arm) + self.time_projection(times)
         padding_mask = None if memory_attention_mask is None else ~memory_attention_mask.to(torch.bool)
         if self.bridge:
             if bridge_aq is None or bridge_raw is None or len(bridge_aq) != len(self.decoder) or len(bridge_raw) != len(self.decoder):
@@ -162,6 +206,8 @@ class WaypointModel(nn.Module):
             gripper = self.gripper_head(features).squeeze(-1)
         else:
             gripper = translation.new_zeros(translation.shape[:-1])
+        if return_features:
+            return translation, rotation, gripper, features
         return translation, rotation, gripper
 
 
@@ -291,9 +337,18 @@ class QwenSpatialOFT(Qwenvl_OFT):
                 raise ValueError(
                     f"spatial.bridge_layers must be increasing indices in [1, {num_vlm_layers}], got {self.bridge_layers}"
                 )
+        self.anchor_mode = str(spatial.get("anchor_mode", "absolute"))
+        # Auxiliary supervision on the waypoint slots; heads exist only when weighted.
+        self.phase_weight = float(spatial.get("phase_weight", 0.0))
+        self.object_weight = float(spatial.get("object_weight", 0.0))
+        if self.phase_weight < 0 or self.object_weight < 0:
+            raise ValueError("spatial.phase_weight and spatial.object_weight must be non-negative")
+        if (self.phase_weight or self.object_weight) and not self.bridge_layers:
+            raise ValueError("Phase/object supervision is defined for the Bridge architecture only")
         self.waypoint_model = WaypointModel(
             hidden_size, self.spatial_width, heads, ffn_width, layers, len(self.waypoint_tau), predict_gripper=gated,
-            bridge_layers=len(self.bridge_layers),
+            bridge_layers=len(self.bridge_layers), anchor_mode=self.anchor_mode,
+            num_phases=len(PHASES) if self.phase_weight > 0 else 0, predict_object=self.object_weight > 0,
         )
         self.spatial_adapter = SpatialAdapter(
             hidden_size, self.spatial_width, heads, len(self.waypoint_tau), gated=gated,
@@ -447,15 +502,18 @@ class QwenSpatialOFT(Qwenvl_OFT):
             examples, last_hidden, action_queries, memory_attention_mask
         )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            # The same WaypointModel.forward serves both domains.
-            translation, rotation_6d, waypoint_gripper = self.waypoint_model(
+            # The same WaypointModel.forward serves both domains; arm_id tells them apart.
+            translation, rotation_6d, waypoint_gripper, slot_features = self.waypoint_model(
                 waypoint_features,
                 anchor_pose,
                 tau,
                 memory_attention_mask,
                 bridge_aq=bridge_aq,
                 bridge_raw=bridge_raw,
+                arm_id=ARM_ID[domain],
+                return_features=True,
             )
+            auxiliary_outputs = self.waypoint_model.auxiliary_outputs(slot_features) if train else {}
             if domain == "robot":
                 conditioned_queries, spatial_residual, extra_metrics = self._condition_action_queries(
                     examples,
@@ -475,7 +533,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         if domain == "human":
             if not train:
                 return None, waypoint_prediction, None, {}
-            return self._human_geometry_loss(examples, waypoint_prediction, device)
+            return self._human_geometry_loss(examples, waypoint_prediction, device, auxiliary_outputs)
         if not train:
             return pred_actions, waypoint_prediction, spatial_residual, {**memory_metrics, **extra_metrics}
 
@@ -522,10 +580,12 @@ class QwenSpatialOFT(Qwenvl_OFT):
             gripper_loss = bc_loss.new_zeros(())
         relation_loss = bc_loss.new_zeros(())
         action_geometry_loss = bc_loss.new_zeros(())
+        slot_losses = self._slot_supervision_losses(labels, auxiliary_outputs, device, domain)
         auxiliary_loss = (
             self.waypoint_weight * waypoint_loss
             + self.gripper_weight * gripper_loss
             + self.action_geometry_weight * action_geometry_loss
+            + slot_losses.pop("slot_loss")
         )
         total_loss = bc_loss + auxiliary_loss
         residual_ratio = spatial_residual.detach().float().square().mean().sqrt() / (
@@ -543,6 +603,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
             "relation_loss": relation_loss,
             "action_geometry_loss": action_geometry_loss,
             "spatial_residual_ratio": residual_ratio,
+            **slot_losses,
             **memory_metrics,
             **extra_metrics,
         }
@@ -554,8 +615,57 @@ class QwenSpatialOFT(Qwenvl_OFT):
         ratios += [torch.tanh(block.raw_gate).detach() for block in self.spatial_adapter.blocks]
         return {"bridge_raw_ratio_mean": torch.stack(ratios).abs().mean()}
 
-    def _human_geometry_loss(self, examples: list[dict], waypoint_prediction: torch.Tensor, device: torch.device) -> dict:
-        """Human pretraining: geometry supervision only (no robot actions, no gripper labels)."""
+    @staticmethod
+    def _stack_slot_labels(labels: list[dict], key: str, valid_key: str, shape: tuple[int, ...], device, dtype):
+        """Stack an optional per-slot label; the whole batch must provide it or none does."""
+        present = [key in label for label in labels]
+        if not any(present):
+            return None, None
+        if not all(present):
+            raise ValueError(f"geometry_labels.{key} must be present for every example in a batch or for none")
+        values = torch.as_tensor(np.stack([label[key] for label in labels]), device=device, dtype=dtype)
+        valid = torch.as_tensor(np.stack([label[valid_key] for label in labels]), device=device, dtype=torch.bool)
+        if tuple(values.shape) != (len(labels), *shape) or tuple(valid.shape) != (len(labels), shape[0]):
+            raise ValueError(
+                f"Invalid {key} labels: values={tuple(values.shape)}, valid={tuple(valid.shape)}, expected={(len(labels), *shape)}"
+            )
+        return values, valid
+
+    def _slot_supervision_losses(self, labels: list[dict], outputs: dict, device, domain: str) -> dict:
+        """Weighted phase (both domains) and object (where labelled) losses on the waypoint slots."""
+        slots = len(self.waypoint_tau)
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        losses = {"slot_loss": zero}
+        if self.phase_weight > 0:
+            phase, valid = self._stack_slot_labels(labels, "future_phase", "future_phase_valid", (slots,), device, torch.long)
+            if phase is None:
+                raise ValueError(f"spatial.phase_weight > 0 needs geometry_labels.future_phase for the {domain} domain")
+            logits = outputs["phase_logits"].float()
+            if torch.any(valid):
+                phase_loss = nn.functional.cross_entropy(logits[valid], phase[valid])
+                phase_accuracy = (logits[valid].argmax(-1) == phase[valid]).float().mean()
+            else:
+                phase_loss, phase_accuracy = logits.sum() * 0.0, zero
+            losses.update(phase_loss=phase_loss, phase_accuracy=phase_accuracy.detach())
+            losses["slot_loss"] = losses["slot_loss"] + self.phase_weight * phase_loss
+        if self.object_weight > 0:
+            # LIBERO has no object pose labels; robot batches simply carry no object term.
+            target, valid = self._stack_slot_labels(labels, "future_object", "future_object_valid", (slots, 3), device, torch.float32)
+            if target is not None:
+                prediction = outputs["object_position"].float()
+                if torch.any(valid):
+                    error = (prediction[valid] - target[valid]) / 0.1
+                    object_loss = nn.functional.huber_loss(error, torch.zeros_like(error), delta=1.0)
+                else:
+                    object_loss = prediction.sum() * 0.0
+                losses["object_loss"] = object_loss
+                losses["slot_loss"] = losses["slot_loss"] + self.object_weight * object_loss
+        return losses
+
+    def _human_geometry_loss(
+        self, examples: list[dict], waypoint_prediction: torch.Tensor, device: torch.device, auxiliary_outputs: dict | None = None
+    ) -> dict:
+        """Human batches: geometry (+ optional phase/object) supervision; no robot actions, no gripper labels."""
         labels = [example.get("geometry_labels") for example in examples]
         if any(label is None for label in labels):
             raise ValueError("Human geometry pretraining requires geometry_labels for every example")
@@ -568,13 +678,15 @@ class QwenSpatialOFT(Qwenvl_OFT):
             )
         translation_loss, rotation_loss = relative_pose_loss(waypoint_prediction, target_pose, future_valid)
         waypoint_loss = translation_loss + self.waypoint_rotation_weight * rotation_loss
-        total_loss = self.waypoint_weight * waypoint_loss
+        slot_losses = self._slot_supervision_losses(labels, auxiliary_outputs or {}, device, "human")
+        total_loss = self.waypoint_weight * waypoint_loss + slot_losses.pop("slot_loss")
         return {
             "total_loss": total_loss,
             "has_robot_action": False,
             "waypoint_loss": waypoint_loss,
             "waypoint_translation_loss": translation_loss,
             "waypoint_rotation_loss": rotation_loss,
+            **slot_losses,
             **self._bridge_metrics(),
         }
 

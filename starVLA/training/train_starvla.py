@@ -400,7 +400,7 @@ class VLATrainer(TrainerUtils):
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            self._log_metrics(self._merge_domain_metrics(step_metrics))
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
@@ -410,9 +410,32 @@ class VLATrainer(TrainerUtils):
 
         self._finalize_training()
 
+    @staticmethod
+    def _is_human_batch(examples) -> bool:
+        return bool(examples) and examples[0].get("domain") == "human"
+
+    def _merge_domain_metrics(self, metrics: dict) -> dict:
+        """In co-training, log the latest metrics of both domains on every logging step.
+
+        Human-batch metrics are prefixed with ``human/``. Without this, a deterministic
+        human/robot interleave aligned with logging_frequency would hide one domain.
+        """
+        if metrics.pop("_domain", "robot") == "human":
+            self._last_human_metrics = {f"human/{key}": value for key, value in metrics.items() if not key.startswith("timing/")}
+            merged = dict(getattr(self, "_last_robot_metrics", {}))
+            merged.update({key: value for key, value in metrics.items() if key.startswith("timing/")})
+        else:
+            self._last_robot_metrics = {key: value for key, value in metrics.items() if not key.startswith("timing/")}
+            merged = dict(metrics)
+        merged.update(getattr(self, "_last_human_metrics", {}))
+        return merged
+
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
+        if self._is_human_batch(examples):
+            # Human batches have no robot actions to score.
+            return step_metrics
         actions = [example["action"] for example in examples]
         output_dict = _unwrap_model(self.accelerator, self.model).predict_action(
             examples=examples, use_ddim=True, num_ddim_steps=20
@@ -515,7 +538,7 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        metrics = {"total_loss": total_loss.detach().item()}
+        metrics = {"total_loss": total_loss.detach().item(), "_domain": "robot" if has_robot_action else "human"}
         if has_robot_action:
             metrics["action_dit_loss"] = action_loss.item()
         for key in (
@@ -524,6 +547,9 @@ class VLATrainer(TrainerUtils):
             "waypoint_translation_loss",
             "waypoint_rotation_loss",
             "gripper_loss",
+            "phase_loss",
+            "phase_accuracy",
+            "object_loss",
             "auxiliary_loss",
             "effect_loss",
             "relation_loss",
