@@ -175,6 +175,13 @@ DATASET_NAMED_MIXTURES = {
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "openpi_libero_franka"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "openpi_libero_franka"),
     ],
+    # Spatial:Object:Goal:Long = 1:1:1:2 relative weights (same mechanism as libero_spatial_mem_oft_long2x).
+    "libero_spatial_oft_long2x": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 2.0, "libero_spatial_oft_franka"),
+    ],
     "libero_spatial_oft_all": [
         ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_spatial_oft_franka"),

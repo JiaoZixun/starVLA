@@ -45,159 +45,72 @@ class WaypointDecoderBlock(nn.Module):
         return queries + self.ffn(self.ffn_norm(queries))
 
 
-class CausalExecutionMemory(nn.Module):
-    """Encode strictly-past records and retrieve them for action queries.
+class BridgeAttentionBlock(nn.Module):
+    """VLA-Adapter Bridge Attention over one Qwen layer.
 
-    The visual input is a compact uint8 patch sidecar rather than a second
-    Qwen call.  Eight trainable recurrent slots summarize older records; the
-    recent records remain individually addressable.  ``detach_every`` bounds
-    the history graph and does not change the chronological order.
+    Queries cross-attend (a) to that layer's action-query latents plus extra
+    condition tokens at full weight and (b) to all of that layer's raw tokens
+    through a tanh(g) ratio initialised to zero, so raw features are blended in
+    only as training finds them useful.
     """
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, slots: int = 8, layers: int = 2, detach_every: int = 8, record_dropout: float = 0.0):
+    def __init__(self, vlm_width: int, width: int, heads: int, ffn_width: int):
         super().__init__()
-        self.width = int(width)
-        self.slots = int(slots)
-        self.detach_every = max(1, int(detach_every))
-        self.record_dropout = float(record_dropout)
-        self.visual_projection = nn.Sequential(
-            nn.LayerNorm(2 * 8 * 8 * 8 * 3),
-            nn.Linear(2 * 8 * 8 * 8 * 3, width),
-            nn.GELU(),
-            nn.Linear(width, width),
-        )
-        self.record_projection = nn.Sequential(
-            nn.Linear(8 + 7 + 16 + 1, width), nn.GELU(), nn.Linear(width, width)
-        )
-        self.record_norm = nn.LayerNorm(width)
-        # Slot-specific seeds prevent the long-term slots from collapsing to
-        # identical states when every slot receives the same record input.
-        self.slot_seed = nn.Parameter(torch.empty(slots, width))
-        nn.init.normal_(self.slot_seed, mean=0.0, std=0.02)
-        self.slot_update = nn.GRUCell(width, width)
-        self.retrieval_query = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
-        self.retrieval_layers = nn.ModuleList(
-            [nn.MultiheadAttention(width, heads, batch_first=True) for _ in range(layers)]
-        )
-        self.retrieval_norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(layers)])
-        self.output_projection = nn.Linear(width, vlm_width)
-        self.gate = nn.Sequential(
-            nn.LayerNorm(vlm_width + width + 1),
-            nn.Linear(vlm_width + width + 1, width),
-            nn.Sigmoid(),
-        )
-        # Keep the original OFT action path intact at the insertion point.
-        nn.init.zeros_(self.output_projection.weight)
-        nn.init.zeros_(self.output_projection.bias)
-
-    def _record_features(self, records: dict, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        patches = torch.as_tensor(records["visual_tokens"], device=device)
-        if patches.ndim != 7:
-            raise ValueError(f"memory_records.visual_tokens must be [B,R,V,T,8,8,3], got {tuple(patches.shape)}")
-        # One ordered vector per record preserves both camera and 2x4 spatial layout.
-        expected_tail = (2, 8, 8, 8, 3)
-        if tuple(patches.shape[-5:]) != expected_tail:
-            raise ValueError(f"Expected memory visual tail {expected_tail}, got {tuple(patches.shape[-5:])}")
-        visual = self.visual_projection(patches.float().div(255.0).flatten(start_dim=2))
-        state = torch.as_tensor(records["state"], device=device, dtype=torch.float32)
-        action = torch.as_tensor(records["executed_actions"], device=device, dtype=torch.float32)
-        pose = torch.as_tensor(records["eef_pose"], device=device, dtype=torch.float32).flatten(-2)
-        elapsed = torch.as_tensor(records["elapsed_env_steps"], device=device, dtype=torch.float32).unsqueeze(-1)
-        record_values = torch.cat((state, action, pose, elapsed), dim=-1)
-        record = self.record_projection(record_values)
-        record = self.record_norm(record + visual)
-        valid = torch.as_tensor(records["valid_mask"], device=device, dtype=torch.bool)
-        return record, valid
-
-    def _update_slots(
-        self, slots: torch.Tensor, record: torch.Tensor, valid: torch.Tensor
-    ) -> torch.Tensor:
-        batch, _, _ = record.shape
-        for index in range(record.shape[1]):
-            active = valid[:, index].view(batch, 1, 1)
-            slot_input = record[:, index].unsqueeze(1).expand(-1, self.slots, -1)
-            updated = self.slot_update(
-                slot_input.reshape(-1, self.width), slots.reshape(-1, self.width)
-            ).view(batch, self.slots, self.width)
-            slots = torch.where(active, updated, slots)
-        return slots
+        self.query_norm = nn.LayerNorm(width)
+        self.self_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.aq_projection = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
+        self.raw_projection = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
+        self.aq_query_norm = nn.LayerNorm(width)
+        self.aq_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.raw_query_norm = nn.LayerNorm(width)
+        self.raw_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.raw_gate = nn.Parameter(torch.zeros(()))
+        self.ffn_norm = nn.LayerNorm(width)
+        self.ffn = nn.Sequential(nn.Linear(width, ffn_width), nn.GELU(), nn.Linear(ffn_width, width))
 
     def forward(
         self,
-        action_queries: torch.Tensor,
-        records: dict | None,
-        burnin_records: dict | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch, _, vlm_width = action_queries.shape
-        if records is None:
-            memory_tokens = action_queries.new_zeros((batch, 1, self.width))
-            memory_valid = torch.zeros((batch, 1), device=action_queries.device, dtype=torch.bool)
-            return (
-                action_queries,
-                memory_tokens,
-                memory_valid,
-                action_queries.new_zeros((batch, vlm_width)),
-                action_queries.new_zeros((batch, self.width)),
-                action_queries.new_zeros((batch, action_queries.shape[1], self.width)),
-            )
-        record, valid = self._record_features(records, action_queries.device)
-        if record.shape[0] != batch:
-            raise ValueError(f"Memory batch mismatch: records={record.shape[0]} queries={batch}")
-        if self.training and self.record_dropout > 0:
-            keep = torch.rand(valid.shape, device=valid.device) >= self.record_dropout
-            valid = valid & keep
-        # Burn-in reconstructs long-term state from the episode prefix without
-        # retaining its graph. Only the recent window contributes BPTT.
-        slots = self.slot_seed.unsqueeze(0).expand(batch, -1, -1)
-        if burnin_records is not None and burnin_records["valid_mask"].shape[1] > 0:
-            with torch.no_grad():
-                burnin, burnin_valid = self._record_features(burnin_records, action_queries.device)
-                if self.training and self.record_dropout > 0:
-                    keep = torch.rand(burnin_valid.shape, device=burnin_valid.device) >= self.record_dropout
-                    burnin_valid = burnin_valid & keep
-                slots = self._update_slots(slots, burnin, burnin_valid)
-            slots = slots.detach()
-
-        # Recent records remain differentiable, with periodic graph truncation.
-        for start in range(0, record.shape[1], self.detach_every):
-            stop = min(start + self.detach_every, record.shape[1])
-            slots = self._update_slots(slots, record[:, start:stop], valid[:, start:stop])
-            if stop % self.detach_every == 0:
-                slots = slots.detach()
-        # Retrieval keys are recent records followed by long-term slots.
-        retrieval = torch.cat((record, slots), dim=1)
-        retrieval_valid = torch.cat(
-            (valid, torch.ones((batch, self.slots), device=valid.device, dtype=torch.bool)), dim=1
+        queries: torch.Tensor,
+        aq_features: torch.Tensor,
+        raw_features: torch.Tensor,
+        raw_padding_mask: torch.Tensor | None,
+        condition_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        normalized = self.query_norm(queries)
+        attended, _ = self.self_attention(normalized, normalized, normalized, need_weights=False)
+        queries = queries + attended
+        aq_keys = self.aq_projection(aq_features)
+        if condition_tokens is not None:
+            aq_keys = torch.cat((aq_keys, condition_tokens.to(aq_keys.dtype)), dim=1)
+        attended, _ = self.aq_attention(self.aq_query_norm(queries), aq_keys, aq_keys, need_weights=False)
+        raw_keys = self.raw_projection(raw_features)
+        raw_attended, _ = self.raw_attention(
+            self.raw_query_norm(queries), raw_keys, raw_keys,
+            key_padding_mask=raw_padding_mask, need_weights=False,
         )
-        query = self.retrieval_query(action_queries)
-        padding = ~retrieval_valid
-        for attention, norm in zip(self.retrieval_layers, self.retrieval_norms):
-            update, _ = attention(query, retrieval, retrieval, key_padding_mask=padding, need_weights=False)
-            query = norm(query + update)
-        # The same per-query memory gate controls the summary consumed by the
-        # waypoint path and the residual consumed by the action path.
-        retrieval_summary = query.mean(dim=1)
-        elapsed_summary = torch.as_tensor(records["elapsed_env_steps"], device=action_queries.device, dtype=torch.float32)
-        elapsed_summary = (elapsed_summary * valid.float()).sum(dim=1, keepdim=True) / valid.float().sum(dim=1, keepdim=True).clamp_min(1.0)
-        gate_input = torch.cat((action_queries, retrieval_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1), elapsed_summary.unsqueeze(1).expand(-1, action_queries.shape[1], -1)), dim=-1)
-        gates = self.gate(gate_input)
-        summary = (query * gates).mean(dim=1)
-        conditioned = action_queries + self.output_projection(gates * query)
-        return conditioned, retrieval, retrieval_valid, summary, gates.mean(dim=1), gates.detach()
+        queries = queries + attended + torch.tanh(self.raw_gate).to(raw_attended.dtype) * raw_attended
+        return queries + self.ffn(self.ffn_norm(queries))
 
 
 class WaypointModel(nn.Module):
     """Predict relative SE(3) waypoints from task-conditioned action-token features."""
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4, predict_gripper: bool = True):
+    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4, predict_gripper: bool = True, bridge_layers: int = 0):
         super().__init__()
         self.width = width
         self.predict_gripper = bool(predict_gripper)
-        self.memory_projection = nn.Linear(vlm_width, width)
+        self.bridge = int(bridge_layers) > 0
         self.anchor_projection = nn.Sequential(nn.Linear(9, width), nn.GELU(), nn.Linear(width, width))
         self.arm_embedding = nn.Embedding(2, width)
         self.time_projection = nn.Sequential(nn.Linear(1, width), nn.GELU(), nn.Linear(width, width))
-        self.decoder = nn.ModuleList([WaypointDecoderBlock(width, heads, ffn_width) for _ in range(layers)])
+        if self.bridge:
+            # One Bridge Attention block per selected Qwen layer (shallow -> deep).
+            self.decoder = nn.ModuleList(
+                [BridgeAttentionBlock(vlm_width, width, heads, ffn_width) for _ in range(int(bridge_layers))]
+            )
+        else:
+            self.memory_projection = nn.Linear(vlm_width, width)
+            self.decoder = nn.ModuleList([WaypointDecoderBlock(width, heads, ffn_width) for _ in range(layers)])
         self.output_norm = nn.LayerNorm(width)
         self.translation_head = nn.Linear(width, 3)
         self.rotation_head = nn.Linear(width, 6)
@@ -218,20 +131,30 @@ class WaypointModel(nn.Module):
         anchor_pose: torch.Tensor,
         tau: torch.Tensor,
         memory_attention_mask: torch.Tensor | None = None,
+        bridge_aq: list[torch.Tensor] | None = None,
+        bridge_raw: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = vlm_features.shape[0]
+        batch_size = anchor_pose.shape[0]
         rotation_6d = matrix_to_rotation_6d(anchor_pose[..., :3, :3])
         anchor_features = torch.cat((anchor_pose[..., :3, 3].float(), rotation_6d), dim=-1)
         times = tau.float().view(1, -1, 1).expand(batch_size, -1, -1)
+        anchor_token = self.anchor_projection(anchor_features).unsqueeze(1)
         query = (
-            self.anchor_projection(anchor_features).unsqueeze(1)
-            + self.arm_embedding(torch.zeros((batch_size, 1), device=vlm_features.device, dtype=torch.long))
+            anchor_token
+            + self.arm_embedding(torch.zeros((batch_size, 1), device=anchor_pose.device, dtype=torch.long))
             + self.time_projection(times)
         )
-        memory = self.memory_projection(vlm_features)
         padding_mask = None if memory_attention_mask is None else ~memory_attention_mask.to(torch.bool)
-        for layer in self.decoder:
-            query = layer(query, memory, padding_mask)
+        if self.bridge:
+            if bridge_aq is None or bridge_raw is None or len(bridge_aq) != len(self.decoder) or len(bridge_raw) != len(self.decoder):
+                raise ValueError(f"Bridge WaypointModel needs {len(self.decoder)} per-layer action-query and raw features")
+            # The current pose (proprio) joins the action-query keys, as in VLA-Adapter.
+            for layer, aq, raw in zip(self.decoder, bridge_aq, bridge_raw):
+                query = layer(query, aq, raw, padding_mask, condition_tokens=anchor_token)
+        else:
+            memory = self.memory_projection(vlm_features)
+            for layer in self.decoder:
+                query = layer(query, memory, padding_mask)
         features = self.output_norm(query)
         translation = self.translation_head(features)
         rotation = self.rotation_head(features)
@@ -245,15 +168,25 @@ class WaypointModel(nn.Module):
 class SpatialAdapter(nn.Module):
     """Cross-attend action queries to explicit metric waypoint tokens."""
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4, gated: bool = True):
+    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4, gated: bool = True, bridge_layers: int = 0, ffn_width: int = 1024):
         super().__init__()
         # v1 (ungated) has no gripper token channel and no spatial gate.
         self.gated = bool(gated)
+        self.bridge = int(bridge_layers) > 0
+        if self.bridge and not self.gated:
+            raise ValueError("Bridge SpatialAdapter requires the gated (v2) adapter")
         self.action_projection = nn.Sequential(nn.LayerNorm(vlm_width), nn.Linear(vlm_width, width))
         self.spatial_projection = nn.Sequential(
             nn.Linear(12 if self.gated else 11, width), nn.GELU(), nn.Linear(width, width)
         )
-        self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        if self.bridge:
+            # Predicted metric waypoint tokens are the condition tokens of every Bridge block.
+            self.blocks = nn.ModuleList(
+                [BridgeAttentionBlock(vlm_width, width, heads, ffn_width) for _ in range(int(bridge_layers))]
+            )
+            self.output_norm = nn.LayerNorm(width)
+        else:
+            self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
         if self.gated:
             self.spatial_gate = nn.Sequential(
                 nn.LayerNorm(vlm_width + width),
@@ -272,6 +205,9 @@ class SpatialAdapter(nn.Module):
         rotation_6d: torch.Tensor,
         gripper: torch.Tensor,
         tau: torch.Tensor,
+        bridge_aq: list[torch.Tensor] | None = None,
+        bridge_raw: list[torch.Tensor] | None = None,
+        raw_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = action_features.shape[0]
         normalized_time = tau.float().view(1, -1, 1).expand(batch_size, -1, -1)
@@ -283,7 +219,15 @@ class SpatialAdapter(nn.Module):
         token_values = torch.cat((*values, normalized_time, arm_id), dim=-1)
         queries = self.action_projection(action_features)
         keys = self.spatial_projection(token_values)
-        update, _ = self.cross_attention(queries, keys, keys, need_weights=False)
+        if self.bridge:
+            if bridge_aq is None or bridge_raw is None or len(bridge_aq) != len(self.blocks) or len(bridge_raw) != len(self.blocks):
+                raise ValueError(f"Bridge SpatialAdapter needs {len(self.blocks)} per-layer action-query and raw features")
+            update = queries
+            for block, aq, raw in zip(self.blocks, bridge_aq, bridge_raw):
+                update = block(update, aq, raw, raw_padding_mask, condition_tokens=keys)
+            update = self.output_norm(update)
+        else:
+            update, _ = self.cross_attention(queries, keys, keys, need_weights=False)
         if self.gated:
             gates = self.spatial_gate(torch.cat((action_features, update), dim=-1))
         else:
@@ -303,7 +247,7 @@ class QwenSpatialOFTDefaultConfig:
             "heads": 4,
             "ffn_width": 1024,
             "layers": 2,
-            "tau": [1, 4, 8, 16],
+            "tau": [1, 2, 4, 8],
             "waypoint_weight": 1.0,
             "waypoint_rotation_weight": 0.25,
             "gripper_weight": 0.10,
@@ -336,10 +280,25 @@ class QwenSpatialOFT(Qwenvl_OFT):
         if self.adapter_version not in ("v1", "v2"):
             raise ValueError(f"spatial.adapter_version must be v1 or v2, got {self.adapter_version}")
         gated = self.adapter_version == "v2"
+        # Bridge Attention (VLA-Adapter): hidden_states indices of the Qwen layers
+        # read by both the waypoint decoder and the spatial action adapter.
+        self.bridge_layers = tuple(int(v) for v in (spatial.get("bridge_layers") or ()))
+        num_vlm_layers = int(self.qwen_vl_interface.model.config.get_text_config().num_hidden_layers)
+        if self.bridge_layers:
+            if tuple(sorted(set(self.bridge_layers))) != self.bridge_layers or not (
+                1 <= self.bridge_layers[0] and self.bridge_layers[-1] <= num_vlm_layers
+            ):
+                raise ValueError(
+                    f"spatial.bridge_layers must be increasing indices in [1, {num_vlm_layers}], got {self.bridge_layers}"
+                )
         self.waypoint_model = WaypointModel(
-            hidden_size, self.spatial_width, heads, ffn_width, layers, len(self.waypoint_tau), predict_gripper=gated
+            hidden_size, self.spatial_width, heads, ffn_width, layers, len(self.waypoint_tau), predict_gripper=gated,
+            bridge_layers=len(self.bridge_layers),
         )
-        self.spatial_adapter = SpatialAdapter(hidden_size, self.spatial_width, heads, len(self.waypoint_tau), gated=gated)
+        self.spatial_adapter = SpatialAdapter(
+            hidden_size, self.spatial_width, heads, len(self.waypoint_tau), gated=gated,
+            bridge_layers=len(self.bridge_layers), ffn_width=ffn_width,
+        )
         self.waypoint_weight = float(spatial.get("waypoint_weight", 1.0))
         self.waypoint_rotation_weight = float(spatial.get("waypoint_rotation_weight", 0.25))
         self.gripper_weight = float(spatial.get("gripper_weight", 0.10 if gated else 0.0))
@@ -359,6 +318,11 @@ class QwenSpatialOFT(Qwenvl_OFT):
             )
 
     def _build_inputs(self, examples: list[dict[str, Any]]) -> tuple[dict, torch.Tensor]:
+        qwen_inputs, hidden_states = self._build_inputs_all_layers(examples)
+        return qwen_inputs, hidden_states[-1]
+
+    def _build_inputs_all_layers(self, examples: list[dict[str, Any]]) -> tuple[dict, tuple[torch.Tensor, ...]]:
+        """Shared by the human and robot domains: same prompt, same action-query tokens."""
         batch_images = [to_pil_preserve(example["image"]) for example in examples]
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
@@ -378,7 +342,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
                 output_hidden_states=True,
                 return_dict=True,
             )
-        return qwen_inputs, outputs.hidden_states[-1]
+        return qwen_inputs, tuple(outputs.hidden_states)
 
     def _batch_geometry_current(self, examples: list[dict], device: torch.device) -> torch.Tensor:
         values = []
@@ -400,9 +364,13 @@ class QwenSpatialOFT(Qwenvl_OFT):
         rotation_6d: torch.Tensor,
         gripper: torch.Tensor,
         tau: torch.Tensor,
+        bridge_aq: list[torch.Tensor] | None = None,
+        bridge_raw: list[torch.Tensor] | None = None,
+        raw_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         conditioned, residual, spatial_gate = self.spatial_adapter(
-            action_queries, translation, rotation_6d, gripper, tau
+            action_queries, translation, rotation_6d, gripper, tau,
+            bridge_aq=bridge_aq, bridge_raw=bridge_raw, raw_padding_mask=raw_padding_mask,
         )
         spatial_gate = spatial_gate.float()
         return conditioned, residual, {
@@ -422,10 +390,44 @@ class QwenSpatialOFT(Qwenvl_OFT):
         """Hook for memory-enabled variants; base Spatial OFT stays unchanged."""
         return last_hidden, action_queries, attention_mask, {}
 
-    def _predict_from_features(self, examples: list[dict], qwen_inputs: dict, last_hidden: torch.Tensor, *, train: bool):
+    @staticmethod
+    def _batch_domain(examples: list[dict]) -> str:
+        domains = {str(example.get("domain", "robot")) for example in examples}
+        if len(domains) != 1 or not domains <= {"robot", "human"}:
+            raise ValueError(f"A batch must contain exactly one domain (robot or human), got {sorted(domains)}")
+        return domains.pop()
+
+    def _bridge_features(self, qwen_inputs: dict, hidden_states: tuple[torch.Tensor, ...]):
+        """Per selected layer: action-query latents [B,chunk,H] and all raw tokens [B,L,H]."""
+        if len(hidden_states) <= self.bridge_layers[-1]:
+            raise ValueError(f"Qwen returned {len(hidden_states)} hidden states; bridge needs index {self.bridge_layers[-1]}")
+        raw = [hidden_states[index] for index in self.bridge_layers]
+        aq = [
+            self._gather_action_token_embeddings(layer, qwen_inputs.get("input_ids"), action_token_id=self.action_token_id)
+            for layer in raw
+        ]
+        return aq, raw
+
+    def _predict_from_features(
+        self,
+        examples: list[dict],
+        qwen_inputs: dict,
+        last_hidden: torch.Tensor,
+        *,
+        train: bool,
+        hidden_states: tuple[torch.Tensor, ...] | None = None,
+    ):
         device = last_hidden.device
+        domain = self._batch_domain(examples)
+        if domain == "human" and self.bridge_layers == ():
+            raise ValueError("Human geometry pretraining is defined for the Bridge architecture only")
         anchor_pose = self._batch_geometry_current(examples, device)
         tau = torch.tensor(self.waypoint_tau, device=device, dtype=torch.float32) / float(max(self.waypoint_tau))
+        bridge_aq = bridge_raw = None
+        if self.bridge_layers:
+            if hidden_states is None:
+                raise ValueError("Bridge QwenSpatialOFT needs all Qwen hidden states")
+            bridge_aq, bridge_raw = self._bridge_features(qwen_inputs, hidden_states)
         # Keep the OFT action queries for the original action head and adapter, while the
         # waypoint decoder attends to the full task-conditioned VLM sequence as specified
         # by the spatial architecture. This reuses the existing VLM forward without a
@@ -445,24 +447,35 @@ class QwenSpatialOFT(Qwenvl_OFT):
             examples, last_hidden, action_queries, memory_attention_mask
         )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            # The same WaypointModel.forward serves both domains.
             translation, rotation_6d, waypoint_gripper = self.waypoint_model(
                 waypoint_features,
                 anchor_pose,
                 tau,
                 memory_attention_mask,
+                bridge_aq=bridge_aq,
+                bridge_raw=bridge_raw,
             )
-            conditioned_queries, spatial_residual, extra_metrics = self._condition_action_queries(
-                examples,
-                action_queries,
-                translation,
-                rotation_6d,
-                waypoint_gripper,
-                tau,
-            )
-            pred_actions = self.action_model.predict_action(conditioned_queries)
+            if domain == "robot":
+                conditioned_queries, spatial_residual, extra_metrics = self._condition_action_queries(
+                    examples,
+                    action_queries,
+                    translation,
+                    rotation_6d,
+                    waypoint_gripper,
+                    tau,
+                    bridge_aq=bridge_aq,
+                    bridge_raw=bridge_raw,
+                    raw_padding_mask=None if memory_attention_mask is None else ~memory_attention_mask.to(torch.bool),
+                )
+                pred_actions = self.action_model.predict_action(conditioned_queries)
         waypoint_prediction = torch.eye(4, device=device, dtype=torch.float32).view(1, 1, 4, 4).repeat(len(examples), len(self.waypoint_tau), 1, 1)
         waypoint_prediction[..., :3, :3] = rotation_6d_to_matrix(rotation_6d)
         waypoint_prediction[..., :3, 3] = translation.float()
+        if domain == "human":
+            if not train:
+                return None, waypoint_prediction, None, {}
+            return self._human_geometry_loss(examples, waypoint_prediction, device)
         if not train:
             return pred_actions, waypoint_prediction, spatial_residual, {**memory_metrics, **extra_metrics}
 
@@ -534,17 +547,66 @@ class QwenSpatialOFT(Qwenvl_OFT):
             **extra_metrics,
         }
 
+    def _bridge_metrics(self) -> dict[str, torch.Tensor]:
+        if not self.bridge_layers:
+            return {}
+        ratios = [torch.tanh(block.raw_gate).detach() for block in self.waypoint_model.decoder]
+        ratios += [torch.tanh(block.raw_gate).detach() for block in self.spatial_adapter.blocks]
+        return {"bridge_raw_ratio_mean": torch.stack(ratios).abs().mean()}
+
+    def _human_geometry_loss(self, examples: list[dict], waypoint_prediction: torch.Tensor, device: torch.device) -> dict:
+        """Human pretraining: geometry supervision only (no robot actions, no gripper labels)."""
+        labels = [example.get("geometry_labels") for example in examples]
+        if any(label is None for label in labels):
+            raise ValueError("Human geometry pretraining requires geometry_labels for every example")
+        target_pose = torch.as_tensor(np.stack([label["relative_waypoints"] for label in labels]), device=device, dtype=torch.float32)
+        future_valid = torch.as_tensor(np.stack([label["future_valid"] for label in labels]), device=device, dtype=torch.bool)
+        if target_pose.shape != waypoint_prediction.shape or future_valid.shape != waypoint_prediction.shape[:2]:
+            raise ValueError(
+                f"Invalid human waypoint labels: poses={tuple(target_pose.shape)}, masks={tuple(future_valid.shape)}, "
+                f"expected={tuple(waypoint_prediction.shape)}"
+            )
+        translation_loss, rotation_loss = relative_pose_loss(waypoint_prediction, target_pose, future_valid)
+        waypoint_loss = translation_loss + self.waypoint_rotation_weight * rotation_loss
+        total_loss = self.waypoint_weight * waypoint_loss
+        return {
+            "total_loss": total_loss,
+            "has_robot_action": False,
+            "waypoint_loss": waypoint_loss,
+            "waypoint_translation_loss": translation_loss,
+            "waypoint_rotation_loss": rotation_loss,
+            **self._bridge_metrics(),
+        }
+
     def forward(self, examples: list[dict] = None, **kwargs):
-        qwen_inputs, last_hidden = self._build_inputs(examples)
-        return self._predict_from_features(examples, qwen_inputs, last_hidden, train=True)
+        qwen_inputs, hidden_states = self._build_inputs_all_layers(examples)
+        outputs = self._predict_from_features(
+            examples, qwen_inputs, hidden_states[-1], train=True, hidden_states=hidden_states
+        )
+        if outputs.get("has_robot_action", True):
+            outputs.update(self._bridge_metrics())
+        return outputs
 
     @torch.inference_mode()
     def predict_action(self, examples: list[dict] = None, **kwargs):
         if type(examples) is not list:
             examples = [examples]
-        qwen_inputs, last_hidden = self._build_inputs(examples)
-        pred_actions, _, _, _ = self._predict_from_features(examples, qwen_inputs, last_hidden, train=False)
+        qwen_inputs, hidden_states = self._build_inputs_all_layers(examples)
+        pred_actions, _, _, _ = self._predict_from_features(
+            examples, qwen_inputs, hidden_states[-1], train=False, hidden_states=hidden_states
+        )
         return {"normalized_actions": pred_actions.detach().float().cpu().numpy()}
+
+    @torch.inference_mode()
+    def predict_waypoints(self, examples: list[dict] = None, **kwargs) -> torch.Tensor:
+        """Relative SE(3) waypoints [B,K,4,4] for either domain; used for geometry validation."""
+        if type(examples) is not list:
+            examples = [examples]
+        qwen_inputs, hidden_states = self._build_inputs_all_layers(examples)
+        _, waypoints, _, _ = self._predict_from_features(
+            examples, qwen_inputs, hidden_states[-1], train=False, hidden_states=hidden_states
+        )
+        return waypoints
 
 
 __all__ = ["QwenSpatialOFT", "WaypointModel", "SpatialAdapter"]

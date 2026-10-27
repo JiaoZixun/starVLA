@@ -92,7 +92,8 @@ def setup_directories(cfg) -> Path:
 
 def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     """Prepare VLA training data."""
-    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
+    data_cfg = cfg.datasets.vla_data
+    logger.info(f"Creating VLA Dataset `{data_cfg.get('data_mix', data_cfg.get('dataset_py'))}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
@@ -393,7 +394,8 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            eval_interval = int(self.config.trainer.get("eval_interval", 0) or 0)
+            if eval_interval > 0 and self.completed_steps % eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
@@ -444,7 +446,11 @@ class VLATrainer(TrainerUtils):
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
+                has_robot_action = output_dict.get("has_robot_action", True)
                 action_loss = output_dict.get("bc_loss", output_dict.get("action_loss"))
+                if action_loss is None and not has_robot_action:
+                    # Human geometry pretraining: no BC term; the geometry loss is the objective.
+                    action_loss = output_dict["total_loss"]
                 if action_loss is None:
                     raise KeyError("Model forward must return `bc_loss` or legacy `action_loss`")
                 total_loss = output_dict.get("total_loss", action_loss)
@@ -509,8 +515,11 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        metrics = {"action_dit_loss": action_loss.item(), "total_loss": total_loss.detach().item()}
+        metrics = {"total_loss": total_loss.detach().item()}
+        if has_robot_action:
+            metrics["action_dit_loss"] = action_loss.item()
         for key in (
+            "bridge_raw_ratio_mean",
             "waypoint_loss",
             "waypoint_translation_loss",
             "waypoint_rotation_loss",
@@ -572,6 +581,21 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    max_train_epochs = cfg.trainer.get("max_train_epochs", None)
+    if max_train_epochs is not None:
+        # Exact epoch exposure: one process, no accumulation, so one batch == one optimizer step
+        # and every save lands on an epoch boundary.
+        if accelerator.num_processes != 1 or int(cfg.trainer.get("gradient_accumulation_steps", 1)) != 1:
+            raise ValueError("Epoch-mode training requires one process and gradient_accumulation_steps=1")
+        steps_per_epoch = len(vla_train_dataloader)
+        save_every_epochs = int(cfg.trainer.get("save_every_epochs", 1))
+        cfg.trainer.max_train_steps = steps_per_epoch * int(max_train_epochs)
+        cfg.trainer.save_interval = steps_per_epoch * save_every_epochs
+        logger.info(
+            f"Epoch schedule: epochs={max_train_epochs}, samples={len(vla_train_dataloader.dataset)}, "
+            f"steps/epoch={steps_per_epoch}, total_steps={cfg.trainer.max_train_steps}, "
+            f"save every {save_every_epochs} epochs ({cfg.trainer.save_interval} steps)"
+        )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

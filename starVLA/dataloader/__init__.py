@@ -35,7 +35,32 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
-    if dataset_py == "lerobot_datasets":
+    if dataset_py == "human_wrist_dataset":
+        import torch
+        from starVLA.dataloader.human_wrist_dataset import HumanWristGeometryDataset, collate_human_wrist_batch
+
+        data_cfg = cfg.datasets.vla_data
+        dataset = HumanWristGeometryDataset(
+            sidecar_root=data_cfg.geometry_sidecar_root,
+            split=data_cfg.get("split", "train"),
+            waypoint_tau=data_cfg.get("waypoint_tau", [1, 2, 4, 8]),
+            image_size=data_cfg.get("image_size", 224),
+        )
+        workers = int(data_cfg.get("num_workers", 8))
+        kwargs = {
+            "batch_size": int(data_cfg.per_device_batch_size),
+            "collate_fn": collate_human_wrist_batch,
+            "num_workers": workers,
+            "pin_memory": bool(data_cfg.get("pin_memory", True)),
+            "shuffle": True,
+            "drop_last": bool(data_cfg.get("drop_last", False)),
+            "generator": torch.Generator(),
+        }
+        if workers:
+            kwargs["persistent_workers"] = bool(data_cfg.get("persistent_workers", True))
+            kwargs["prefetch_factor"] = int(data_cfg.get("prefetch_factor", 2))
+        return DataLoader(dataset, **kwargs)
+    elif dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
 

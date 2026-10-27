@@ -1,0 +1,84 @@
+# Exp 1: DexYCB wrist-geometry pretraining of Qwen + WaypointModel (Bridge-Spatial architecture).
+# The framework block is copied verbatim from the LIBERO configs so both stages build the same model.
+run_id: qwen35_0p8b_bridge_dexycb_pretrain_e20
+run_root_dir: playground/Checkpoints
+seed: 42
+is_debug: false
+
+framework:
+  name: QwenSpatialOFT
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    local_files_only: true
+    local_model_path: null
+    attn_implementation: sdpa
+    revision: 2fc06364715b967f1860aea9cf38778875588b17
+    gradient_checkpointing: false
+  action_model:
+    action_dim: 7
+    action_hidden_dim: 1024
+    action_model_type: MLP
+    action_horizon: 8
+    future_action_window_size: 7
+    past_action_window_size: 0
+  spatial:
+    width: 256
+    heads: 4
+    ffn_width: 1024
+    layers: 2
+    adapter_version: v2
+    # VLA-Adapter Bridge Attention: hidden_states indices read by the waypoint
+    # decoder and the spatial action adapter (one Bridge block per layer).
+    bridge_layers: [6, 12, 18, 24]
+    tau: [1, 2, 4, 8]
+    waypoint_weight: 1.0
+    waypoint_rotation_weight: 0.25
+    gripper_weight: 0.10
+    action_geometry_weight: 0.0
+    effect_weight: 0.0
+
+datasets:
+  vla_data:
+    dataset_py: human_wrist_dataset
+    geometry_sidecar_root: playground/DerivedData/dexycb_keypoint_se3_v1
+    split: train
+    waypoint_tau: [1, 2, 4, 8]
+    image_size: 224
+    per_device_batch_size: 32
+    drop_last: false
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+
+trainer:
+  max_train_epochs: 20
+  save_every_epochs: 5
+  max_train_steps: null   # set from epochs x steps/epoch
+  save_interval: null     # set from save_every_epochs
+  num_warmup_steps: 500
+  eval_interval: 0
+  learning_rate:
+    base: 5.0e-5
+    qwen_vl_interface: 1.0e-6
+    waypoint_model: 5.0e-5
+  lr_scheduler_type: cosine
+  scheduler_specific_kwargs: {}
+  # No robot actions in this stage: the action head and action adapter get no gradient.
+  freeze_modules: action_model,spatial_adapter
+  is_resume: false
+  pretrained_checkpoint: null
+  reload_modules: null
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 100
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  gradient_checkpointing: false
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8
