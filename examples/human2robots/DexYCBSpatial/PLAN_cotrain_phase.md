@@ -73,7 +73,6 @@ DexYCB e20 两阶段预训练（先人手几何、再 LIBERO）在标准 LIBERO 
 |---|---|---|
 | A. 混合训练 | 方案 1+2，`human_every: 4`，阶段/物体权重 0 | Bridge-Spatial only（92.00% @50K） |
 | B. 混合训练 + 阶段/物体监督 | 方案 1+2+3，`phase_weight: 0.1`，`object_weight: 0.5` | A |
-| C. OFT + long2x 对照（未在本分支实现，只需配置） | OFT 基准结构 + `libero_long2x` 混合比例 | 判断 Long 提升来自空间信息还是数据比例 |
 
 判定标准：标准 LIBERO 平均分标准误约 0.6 pp，Long 约 1.8 pp。只有平均分差 > 1.2 pp 或 Long 差 > 3.6 pp（约 2σ）才视为有效差异。
 
@@ -87,8 +86,8 @@ DexYCB e20 两阶段预训练（先人手几何、再 LIBERO）在标准 LIBERO 
   - 时间重标定后 train 中位位移 0.0070/0.0138/0.0278/0.0557 m，LIBERO 0.0064/0.0128/0.0255/0.0502 m（差距从 1.5–1.9 倍降到约 1.1 倍）
   - 当前时刻阶段分布（train）：approach 30.8%、grasp 11.2%、transport 58.0%
 - [x] GPU 冒烟测试：两份配置各跑 12 步（batch 4），机器人/人手指标、阶段/物体损失均正常输出，checkpoint 正常保存
-- [ ] 实验 A / B 训练（各约 13 小时）+ 10K–50K 评估
-- [ ] 实验 C（OFT + long2x）
+- [ ] 实验 A（GPU 0）/ B（GPU 1）并行训练 50K 步 + 10K–50K 标准 LIBERO 评估：`run_cotrain_experiments.sh`，日志在 `logs/bridge_spatial_cotrain_<时间>/`
+- 实验 C（OFT + long2x 对照）按 2026-10-27 决定不做
 
 配置说明：两份配置的 `eval_interval` 为 0（Bridge-Spatial only 为 100），因为训练中的动作评估会从交错数据流里额外取一个 batch，打乱 1:3 的节奏。该评估不参与训练，不影响可比性。
 
