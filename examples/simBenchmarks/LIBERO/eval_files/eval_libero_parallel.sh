@@ -23,6 +23,8 @@ CPU_AFFINITY_START/CPU_AFFINITY_COUNT pin each worker to a distinct CPU core;
 SERVER_CPUSET pins the policy server. LIBERO_CONFIG_PATH defaults to a run-local config.
 When saving videos, MAX_VIDEOS_PER_OUTCOME defaults to 1 per task and outcome.
 Set LIBERO_RECORD_INFERENCE_TIMING=1 to record client-observed action-chunk latency.
+Set LIBERO_FAILURE_TRACE=1 for read-only per-episode goal-predicate/grasp traces and a
+failure-mode summary (LIBERO_TRACE_KEYFRAMES_PER_TASK keyframe strips per task, default 5).
 Set ENSURE_BOTH_OUTCOME_VIDEOS=1 to search additional seeds for any missing task outcome.
 GPU_IDS is a legacy alias; only its first GPU is used. MAX_WORKERS is ignored.
 HELP
@@ -53,6 +55,8 @@ SAVE_VIDEOS="${SAVE_VIDEOS:-0}"
 MAX_VIDEOS_PER_OUTCOME="${MAX_VIDEOS_PER_OUTCOME:-1}"
 STOP_AFTER_BOTH_VIDEOS="${STOP_AFTER_BOTH_VIDEOS:-0}"
 LIBERO_RECORD_INFERENCE_TIMING="${LIBERO_RECORD_INFERENCE_TIMING:-0}"
+LIBERO_FAILURE_TRACE="${LIBERO_FAILURE_TRACE:-0}"
+LIBERO_TRACE_KEYFRAMES_PER_TASK="${LIBERO_TRACE_KEYFRAMES_PER_TASK:-5}"
 ENSURE_BOTH_OUTCOME_VIDEOS="${ENSURE_BOTH_OUTCOME_VIDEOS:-0}"
 VIDEO_RETRY_SEEDS="${VIDEO_RETRY_SEEDS:-8:27}"
 VIDEO_RETRY_TRIALS="${VIDEO_RETRY_TRIALS:-50}"
@@ -208,6 +212,8 @@ export SAVE_VIDEOS
 export MAX_VIDEOS_PER_OUTCOME
 export STOP_AFTER_BOTH_VIDEOS
 export LIBERO_RECORD_INFERENCE_TIMING
+export LIBERO_FAILURE_TRACE
+export LIBERO_TRACE_KEYFRAMES_PER_TASK
 export HF_HUB_OFFLINE
 export TRANSFORMERS_OFFLINE
 
@@ -391,6 +397,10 @@ for suite_dir in sorted(
         f.write("\n")
     print(f"{suite_dir.name}: {successes}/{episodes} ({100 * summary['success_rate']:.1f}%)")
 PY
+
+if [[ "${LIBERO_FAILURE_TRACE}" =~ ^(1|true|yes|on)$ ]]; then
+  "${PYTHON}" examples/simBenchmarks/LIBERO/eval_files/summarize_failure_traces.py --run-root "${RUN_ROOT}"
+fi
 
 if [[ "${ENSURE_BOTH_OUTCOME_VIDEOS}" == "1" ]]; then
   echo "Searching additional LIBERO seeds for missing per-task success/failure videos."

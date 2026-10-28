@@ -14,6 +14,7 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+from examples.simBenchmarks.LIBERO.eval_files.failure_trace import EpisodeTracer, failure_trace_enabled
 from examples.simBenchmarks.LIBERO.eval_files.model2libero_interface import ModelClient
 from starVLA.model.framework.VLM4A.spatial_geometry import pose_from_position_axis_angle
 
@@ -114,6 +115,11 @@ def eval_libero(args: Args) -> None:
     }
     if max_videos_per_outcome < 1:
         raise ValueError("MAX_VIDEOS_PER_OUTCOME must be >= 1")
+    # Read-only failure tracing (see failure_trace.py); rollouts are unchanged.
+    trace_failures = failure_trace_enabled()
+    trace_keyframes_per_task = int(os.getenv("LIBERO_TRACE_KEYFRAMES_PER_TASK", "5"))
+    if trace_failures:
+        logging.info("Failure tracing on (keyframe strips for up to %d failures per task)", trace_keyframes_per_task)
     logging.info(
         "Evaluating task IDs [%d, %d) of %d (max_tasks=%d, save_videos=%s, "
         "max_videos_per_outcome=%d)",
@@ -143,6 +149,7 @@ def eval_libero(args: Args) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         saved_task_videos = {"success": 0, "failure": 0}
+        traced_task_failures = 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -160,6 +167,7 @@ def eval_libero(args: Args) -> None:
             )
             replay_images = [] if needs_more_task_videos else None
             full_actions = []
+            tracer = None
 
             logging.info(f"Starting episode {task_episodes + 1}...")
             step = 0
@@ -182,6 +190,12 @@ def eval_libero(args: Args) -> None:
                 # Save preprocessed image for replay video
                 if replay_images is not None:
                     replay_images.append(img)
+                if trace_failures and tracer is None:
+                    tracer = EpisodeTracer(
+                        env, task_id, episode_idx, task_description,
+                        keep_frames=traced_task_failures < trace_keyframes_per_task,
+                    )
+                    tracer.record(obs, None, img)
 
                 state = np.concatenate(
                     (
@@ -248,6 +262,8 @@ def eval_libero(args: Args) -> None:
                 # Capture every actual control after the simulator accepted it;
                 # the next 8-step decision closes this execution event.
                 client_model.record_executed_action(delta_action, step)
+                if tracer is not None:
+                    tracer.record(obs, float(gripper[0]), np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
                 if done:
                     task_successes += 1
                     total_successes += 1
@@ -274,6 +290,12 @@ def eval_libero(args: Args) -> None:
                     fps=10,
                 )
                 saved_task_videos[suffix] += 1
+
+            if tracer is not None:
+                trace = tracer.write(pathlib.Path(args.video_out_path), success=bool(done))
+                traced_task_failures += int(not done)
+                if not done:
+                    logging.info("Failure trace: %s, final goals %s", trace["category"], trace["final_satisfied"])
 
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
