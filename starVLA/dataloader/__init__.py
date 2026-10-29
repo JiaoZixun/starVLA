@@ -35,18 +35,32 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 def _build_human_wrist_dataloader(data_cfg, waypoint_tau):
     import torch
-    from starVLA.dataloader.human_wrist_dataset import HumanWristGeometryDataset, collate_human_wrist_batch
-
-    dataset = HumanWristGeometryDataset(
-        sidecar_root=data_cfg.geometry_sidecar_root,
-        split=data_cfg.get("split", "train"),
-        waypoint_tau=waypoint_tau,
-        image_size=data_cfg.get("image_size", 224),
+    from starVLA.dataloader.human_wrist_dataset import (
+        HumanGroundingDataset, HumanWristGeometryDataset, collate_human_grounding_batch, collate_human_wrist_batch,
     )
+
+    batch_size, collate = int(data_cfg.per_device_batch_size), collate_human_wrist_batch
+    if data_cfg.get("grounding", False):
+        # v3 sidecar: each item is a (real, counterfactual) pair, so draw half as many items.
+        dataset = HumanGroundingDataset(
+            sidecar_root=data_cfg.geometry_sidecar_root, split=data_cfg.get("split", "train"), waypoint_tau=waypoint_tau,
+            image_size=data_cfg.get("image_size", 224), augment=data_cfg.get("augment"),
+            counterfactual=bool(data_cfg.get("counterfactual", True)),
+        )
+        collate = collate_human_grounding_batch
+        if dataset.counterfactual:
+            batch_size //= 2
+    else:
+        dataset = HumanWristGeometryDataset(
+            sidecar_root=data_cfg.geometry_sidecar_root,
+            split=data_cfg.get("split", "train"),
+            waypoint_tau=waypoint_tau,
+            image_size=data_cfg.get("image_size", 224),
+        )
     workers = int(data_cfg.get("num_workers", 8))
     kwargs = {
-        "batch_size": int(data_cfg.per_device_batch_size),
-        "collate_fn": collate_human_wrist_batch,
+        "batch_size": batch_size,
+        "collate_fn": collate,
         "num_workers": workers,
         "pin_memory": bool(data_cfg.get("pin_memory", True)),
         "shuffle": True,

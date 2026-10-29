@@ -1,0 +1,139 @@
+# Exp C: object-grounded Bridge-Spatial OFT, co-trained with DexYCB v3 (P0 + P1 + P2), 30K steps.
+# On top of Exp A (qwen35_0p8b_bridge_spatial_cotrain.yaml):
+#  P0 object tokens: the waypoint decoder also predicts the next manipulated object and its place goal
+#     (xyz in the end-effector frame + uv in the primary image); both feed the action adapter.
+#     Robot labels: libero_grounding_v1 (gripper interaction points); human labels: dexycb_grounding_v3.
+#  P0 language counterfactuals: every DexYCB sample is paired with "pick up the <other object>" on the
+#     same image, supervised on that object's position only.
+#  P1 training-only augmentation: primary-view similarity transform (labels moved with it), photometric
+#     jitter, second-view dropout. No language paraphrasing (keeps LIBERO-plus/PRO zero-shot).
+#  P2 binary gripper closure for both domains (robot commanded gripper, human object-lift onset);
+#     the 4-class phase head is not used. DexYCB uses two views like LIBERO's two images.
+# See examples/human2robots/DexYCBSpatial/PLAN_object_grounding.md.
+run_id: qwen35_0p8b_bridge_spatial_grounding_libero_30k
+run_root_dir: playground/Checkpoints
+seed: 42
+is_debug: false
+
+framework:
+  name: QwenSpatialOFT
+  qwenvl:
+    base_vlm: Qwen/Qwen3.5-0.8B
+    local_files_only: true
+    local_model_path: null
+    attn_implementation: sdpa
+    revision: 2fc06364715b967f1860aea9cf38778875588b17
+    gradient_checkpointing: false
+  action_model:
+    action_dim: 7
+    action_hidden_dim: 1024
+    action_model_type: MLP
+    action_horizon: 8
+    future_action_window_size: 7
+    past_action_window_size: 0
+  spatial:
+    width: 256
+    heads: 4
+    ffn_width: 1024
+    layers: 2
+    adapter_version: v2
+    # VLA-Adapter Bridge Attention: hidden_states indices read by the waypoint
+    # decoder and the spatial action adapter (one Bridge block per layer).
+    bridge_layers: [6, 12, 18, 24]
+    tau: [1, 2, 4, 8]
+    waypoint_weight: 1.0
+    waypoint_rotation_weight: 0.25
+    gripper_weight: 0.10
+    action_geometry_weight: 0.0
+    effect_weight: 0.0
+    anchor_mode: gravity
+    object_slots: 2
+    grounding_xyz_weight: 0.5
+    grounding_uv_weight: 0.5
+
+datasets:
+  vla_data:
+    dataset_py: cotrain_human_robot
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_spatial_oft_long2x
+    geometry_sidecar_root: playground/DerivedData/libero_spatial_oft_v1
+    waypoint_tau: [1, 2, 4, 8]
+    grounding_sidecar_root: playground/DerivedData/libero_grounding_v1
+    gripper_label: closure
+    augment:
+      enabled: true
+      scale: [0.88, 1.08]
+      rotate_deg: 5.0
+      shift: 0.06
+      brightness: 0.25
+      contrast: 0.25
+      saturation: 0.25
+      blur_p: 0.2
+      noise_std: 6.0
+      secondary_dropout: 0.15
+    drop_incomplete_action_chunks: true
+    per_device_batch_size: 32
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    video_backend: torchvision_av
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    # Human batches (one domain per batch): every human_every-th batch is DexYCB.
+    human_data:
+      geometry_sidecar_root: playground/DerivedData/dexycb_grounding_v3
+      grounding: true
+      counterfactual: true
+      augment:
+        enabled: true
+        scale: [0.88, 1.08]
+        rotate_deg: 5.0
+        shift: 0.06
+        brightness: 0.25
+        contrast: 0.25
+        saturation: 0.25
+        blur_p: 0.2
+        noise_std: 6.0
+        secondary_dropout: 0.0
+      split: train
+      human_every: 4
+      image_size: 224
+      per_device_batch_size: 32
+      drop_last: true
+      num_workers: 4
+      pin_memory: true
+      persistent_workers: true
+      prefetch_factor: 2
+
+trainer:
+  max_train_steps: 30000
+  num_warmup_steps: 3000
+  save_interval: 10000
+  eval_interval: 0
+  learning_rate:
+    base: 2.5e-5
+    qwen_vl_interface: 1.0e-5
+    action_model: 1.0e-4
+    waypoint_model: 5.0e-5
+    spatial_adapter: 2.0e-5
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-6
+  freeze_modules: ""
+  is_resume: false
+  pretrained_checkpoint: null
+  reload_modules: null
+  strict_reload: true
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 100
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  gradient_checkpointing: false
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8

@@ -114,6 +114,9 @@ class SpatialLibero4in1DataConfig(Libero4in1DataConfig):
             geometry_sidecar_root=sidecar_root,
             waypoint_tau=tuple(data_cfg.get("waypoint_tau", [1, 4, 8, 16])),
             phase_window_frames=None if phase_window is None else int(phase_window),
+            grounding_sidecar_root=data_cfg.get("grounding_sidecar_root"),
+            gripper_label=str(data_cfg.get("gripper_label", "qpos")),
+            augment=data_cfg.get("augment"),
         )
 
 

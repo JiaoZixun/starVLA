@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset
+from starVLA.dataloader.grounding_augment import GroundingAugment
 from starVLA.dataloader.phase_labels import phases_from_holding, robot_holding_from_gripper_action, slot_phases
 
 
@@ -15,7 +16,8 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
     """Attach geometry labels by (dataset, revision, episode, frame) only."""
 
     def __init__(
-        self, *args, geometry_sidecar_root: str | Path, waypoint_tau=(1, 4, 8, 16), phase_window_frames: int | None = None, **kwargs
+        self, *args, geometry_sidecar_root: str | Path, waypoint_tau=(1, 4, 8, 16), phase_window_frames: int | None = None,
+        grounding_sidecar_root: str | Path | None = None, gripper_label: str = "qpos", augment=None, **kwargs
     ):
         super().__init__(*args, **kwargs)
         # None disables phase labels (default); otherwise the grasp/release window in frames.
@@ -87,6 +89,30 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
             )
         self._geometry_pose_memmap = pose_array
         self._geometry_active_sample: tuple[int, int] | None = None
+        if gripper_label not in ("qpos", "closure"):
+            raise ValueError(f"gripper_label must be qpos or closure, got {gripper_label!r}")
+        self.gripper_label = gripper_label
+        self.augment = GroundingAugment(augment)
+        self.grounding = None
+        if grounding_sidecar_root:
+            self.grounding = self._load_grounding(Path(grounding_sidecar_root) / self.dataset_name, expected_offset)
+        elif gripper_label == "closure":
+            raise ValueError("gripper_label=closure needs grounding_sidecar_root (holding labels)")
+
+    def _load_grounding(self, root: Path, total_frames: int) -> dict:
+        manifest = json.loads((root / "manifest.json").read_text())
+        if manifest.get("format") != "starvla_libero_grounding_sidecar_v1" or manifest.get("dataset_name") != self.dataset_name:
+            raise ValueError(f"Unexpected grounding sidecar in {root}")
+        if manifest.get("dataset_revision") != self.geometry_manifest.get("dataset_revision") or (
+            manifest.get("episode_index_to_sidecar_range") != self.geometry_manifest["episode_index_to_sidecar_range"]
+        ):
+            raise ValueError(f"Grounding sidecar {root} is not aligned with the pose sidecar")
+        arrays = {}
+        for key in ("target_world", "goal_world", "point_valid", "holding", "target_uv", "goal_uv", "target_uv_valid", "goal_uv_valid"):
+            arrays[key] = np.load(root / f"{key}.npy", mmap_mode="r")
+            if len(arrays[key]) != total_frames:
+                raise ValueError(f"Grounding array {key} has {len(arrays[key])} rows, expected {total_frames}")
+        return arrays
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         self._geometry_active_sample = (int(trajectory_id), int(base_index))
@@ -159,6 +185,25 @@ class SpatialLeRobotSingleDataset(LeRobotSingleDataset):
             future_phase, future_phase_valid = slot_phases(self._episode_phases(episode_index, trajectory), future_indices)
             sample["geometry_labels"]["future_phase"] = future_phase
             sample["geometry_labels"]["future_phase_valid"] = future_phase_valid
+        uv = uv_valid = None
+        if self.grounding is not None:
+            g = self.grounding
+            row, labels = offset + frame_index, sample["geometry_labels"]
+            # Slot 0 = object handled next, slot 1 = where it is put (see prepare_grounding_sidecars.py).
+            world = np.stack((g["target_world"][row], g["goal_world"][row])).astype(np.float32)
+            labels["object_xyz"] = (current_rotation_t[None] @ (world - current[:3, 3])[:, :, None])[:, :, 0]
+            labels["object_xyz_valid"] = np.repeat(bool(g["point_valid"][row]), 2)
+            uv = np.stack((g["target_uv"][row], g["goal_uv"][row])).astype(np.float32)
+            uv_valid = np.asarray([g["target_uv_valid"][row], g["goal_uv_valid"][row]], dtype=np.bool_)
+            if self.gripper_label == "closure":
+                # Binary "closed" from the commanded gripper, the same signal human hands provide.
+                for k, source_index in enumerate(future_indices):
+                    if future_gripper_valid[k]:
+                        future_gripper[k] = float(g["holding"][offset + source_index])
+        if self.augment.enabled:
+            sample["image"], uv, uv_valid = self.augment(sample["image"], uv, uv_valid)
+        if uv is not None:
+            sample["geometry_labels"]["object_uv"], sample["geometry_labels"]["object_uv_valid"] = uv, uv_valid
         return sample
 
     def _episode_phases(self, episode_index: int, trajectory) -> np.ndarray:

@@ -121,7 +121,7 @@ class WaypointModel(nn.Module):
     def __init__(
         self, vlm_width: int, width: int = 256, heads: int = 4, ffn_width: int = 1024, layers: int = 2, num_waypoints: int = 4,
         predict_gripper: bool = True, bridge_layers: int = 0, anchor_mode: str = "absolute", num_phases: int = 0,
-        predict_object: bool = False,
+        predict_object: bool = False, num_object_slots: int = 0,
     ):
         super().__init__()
         self.width = width
@@ -162,6 +162,17 @@ class WaypointModel(nn.Module):
         if predict_object:
             # Grasped-object centre in the current end-effector frame at each future slot, in 0.1 m units.
             self.object_head = nn.Linear(width, 3)
+        # Object-centric grounding slots (0 = object handled next, 1 = where it is put), decoded
+        # jointly with the waypoint slots so waypoints can attend to them.
+        self.num_object_slots = int(num_object_slots)
+        if self.num_object_slots:
+            self.object_slot_embedding = nn.Parameter(torch.randn(self.num_object_slots, width) * 0.02)
+            self.grounding_xyz_head = nn.Linear(width, 3)
+            self.grounding_uv_head = nn.Linear(width, 2)
+            nn.init.zeros_(self.grounding_xyz_head.weight)
+            nn.init.zeros_(self.grounding_xyz_head.bias)
+            nn.init.zeros_(self.grounding_uv_head.weight)
+            nn.init.zeros_(self.grounding_uv_head.bias)
 
     def auxiliary_outputs(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         outputs = {}
@@ -188,6 +199,10 @@ class WaypointModel(nn.Module):
         anchor_token = self.anchor_projection(anchor_features(anchor_pose, self.anchor_mode)).unsqueeze(1)
         arm = torch.full((batch_size, 1), int(arm_id), device=anchor_pose.device, dtype=torch.long)
         query = anchor_token + self.arm_embedding(arm) + self.time_projection(times)
+        slots = times.shape[1]
+        if self.num_object_slots:
+            object_query = anchor_token + self.arm_embedding(arm) + self.object_slot_embedding.to(anchor_token.dtype)[None]
+            query = torch.cat((query, object_query), dim=1)
         padding_mask = None if memory_attention_mask is None else ~memory_attention_mask.to(torch.bool)
         if self.bridge:
             if bridge_aq is None or bridge_raw is None or len(bridge_aq) != len(self.decoder) or len(bridge_raw) != len(self.decoder):
@@ -200,6 +215,14 @@ class WaypointModel(nn.Module):
             for layer in self.decoder:
                 query = layer(query, memory, padding_mask)
         features = self.output_norm(query)
+        self.last_grounding = None
+        if self.num_object_slots:
+            object_features, features = features[:, slots:], features[:, :slots]
+            # xyz in the current end-effector frame (0.1 m units out), uv in [0, 1] (0.5 at init).
+            self.last_grounding = {
+                "xyz": self.grounding_xyz_head(object_features).float() * 0.1,
+                "uv": torch.sigmoid(self.grounding_uv_head(object_features).float()),
+            }
         translation = self.translation_head(features)
         rotation = self.rotation_head(features)
         if self.predict_gripper:
@@ -214,7 +237,10 @@ class WaypointModel(nn.Module):
 class SpatialAdapter(nn.Module):
     """Cross-attend action queries to explicit metric waypoint tokens."""
 
-    def __init__(self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4, gated: bool = True, bridge_layers: int = 0, ffn_width: int = 1024):
+    def __init__(
+        self, vlm_width: int, width: int = 256, heads: int = 4, num_waypoints: int = 4, gated: bool = True, bridge_layers: int = 0,
+        ffn_width: int = 1024, num_object_slots: int = 0,
+    ):
         super().__init__()
         # v1 (ungated) has no gripper token channel and no spatial gate.
         self.gated = bool(gated)
@@ -241,6 +267,12 @@ class SpatialAdapter(nn.Module):
             )
         self.output_projection = nn.Linear(width, vlm_width)
         self.num_waypoints = num_waypoints
+        self.num_object_slots = int(num_object_slots)
+        if self.num_object_slots:
+            # Object tokens: xyz (0.1 m units, end-effector frame) + image uv + slot one-hot.
+            self.object_projection = nn.Sequential(
+                nn.Linear(5 + self.num_object_slots, width), nn.GELU(), nn.Linear(width, width)
+            )
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
@@ -254,6 +286,7 @@ class SpatialAdapter(nn.Module):
         bridge_aq: list[torch.Tensor] | None = None,
         bridge_raw: list[torch.Tensor] | None = None,
         raw_padding_mask: torch.Tensor | None = None,
+        grounding: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = action_features.shape[0]
         normalized_time = tau.float().view(1, -1, 1).expand(batch_size, -1, -1)
@@ -265,6 +298,13 @@ class SpatialAdapter(nn.Module):
         token_values = torch.cat((*values, normalized_time, arm_id), dim=-1)
         queries = self.action_projection(action_features)
         keys = self.spatial_projection(token_values)
+        if self.num_object_slots:
+            if grounding is None:
+                raise ValueError("SpatialAdapter with object slots needs the predicted grounding")
+            # Predicted (not ground-truth) object/goal points, as for the waypoint tokens.
+            slot_id = torch.eye(self.num_object_slots, device=keys.device).expand(batch_size, -1, -1)
+            object_values = torch.cat((grounding["xyz"] / 0.1, grounding["uv"], slot_id), dim=-1)
+            keys = torch.cat((keys, self.object_projection(object_values.to(keys.dtype))), dim=1)
         if self.bridge:
             if bridge_aq is None or bridge_raw is None or len(bridge_aq) != len(self.blocks) or len(bridge_raw) != len(self.blocks):
                 raise ValueError(f"Bridge SpatialAdapter needs {len(self.blocks)} per-layer action-query and raw features")
@@ -345,14 +385,24 @@ class QwenSpatialOFT(Qwenvl_OFT):
             raise ValueError("spatial.phase_weight and spatial.object_weight must be non-negative")
         if (self.phase_weight or self.object_weight) and not self.bridge_layers:
             raise ValueError("Phase/object supervision is defined for the Bridge architecture only")
+        # Object-centric grounding tokens (target object, place goal) predicted by the waypoint
+        # decoder, supervised in both domains and fed to the action adapter.
+        self.num_object_slots = int(spatial.get("object_slots", 0))
+        self.grounding_xyz_weight = float(spatial.get("grounding_xyz_weight", 0.0))
+        self.grounding_uv_weight = float(spatial.get("grounding_uv_weight", 0.0))
+        if self.num_object_slots not in (0, 2):
+            raise ValueError(f"spatial.object_slots must be 0 or 2 (target, goal), got {self.num_object_slots}")
+        if self.num_object_slots and not self.bridge_layers:
+            raise ValueError("Object grounding slots are defined for the Bridge architecture only")
         self.waypoint_model = WaypointModel(
             hidden_size, self.spatial_width, heads, ffn_width, layers, len(self.waypoint_tau), predict_gripper=gated,
             bridge_layers=len(self.bridge_layers), anchor_mode=self.anchor_mode,
             num_phases=len(PHASES) if self.phase_weight > 0 else 0, predict_object=self.object_weight > 0,
+            num_object_slots=self.num_object_slots,
         )
         self.spatial_adapter = SpatialAdapter(
             hidden_size, self.spatial_width, heads, len(self.waypoint_tau), gated=gated,
-            bridge_layers=len(self.bridge_layers), ffn_width=ffn_width,
+            bridge_layers=len(self.bridge_layers), ffn_width=ffn_width, num_object_slots=self.num_object_slots,
         )
         self.waypoint_weight = float(spatial.get("waypoint_weight", 1.0))
         self.waypoint_rotation_weight = float(spatial.get("waypoint_rotation_weight", 0.25))
@@ -426,6 +476,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         conditioned, residual, spatial_gate = self.spatial_adapter(
             action_queries, translation, rotation_6d, gripper, tau,
             bridge_aq=bridge_aq, bridge_raw=bridge_raw, raw_padding_mask=raw_padding_mask,
+            grounding=self.waypoint_model.last_grounding,
         )
         spatial_gate = spatial_gate.float()
         return conditioned, residual, {
@@ -533,7 +584,7 @@ class QwenSpatialOFT(Qwenvl_OFT):
         if domain == "human":
             if not train:
                 return None, waypoint_prediction, None, {}
-            return self._human_geometry_loss(examples, waypoint_prediction, device, auxiliary_outputs)
+            return self._human_geometry_loss(examples, waypoint_prediction, device, auxiliary_outputs, waypoint_gripper)
         if not train:
             return pred_actions, waypoint_prediction, spatial_residual, {**memory_metrics, **extra_metrics}
 
@@ -581,12 +632,15 @@ class QwenSpatialOFT(Qwenvl_OFT):
         relation_loss = bc_loss.new_zeros(())
         action_geometry_loss = bc_loss.new_zeros(())
         slot_losses = self._slot_supervision_losses(labels, auxiliary_outputs, device, domain)
+        grounding = self._grounding_losses(labels, device)
         auxiliary_loss = (
             self.waypoint_weight * waypoint_loss
             + self.gripper_weight * gripper_loss
             + self.action_geometry_weight * action_geometry_loss
             + slot_losses.pop("slot_loss")
+            + grounding.pop("grounding_loss")
         )
+        slot_losses.update(grounding)
         total_loss = bc_loss + auxiliary_loss
         residual_ratio = spatial_residual.detach().float().square().mean().sqrt() / (
             action_queries.detach().float().square().mean().sqrt() + 1e-8
@@ -662,8 +716,30 @@ class QwenSpatialOFT(Qwenvl_OFT):
                 losses["slot_loss"] = losses["slot_loss"] + self.object_weight * object_loss
         return losses
 
+    def _grounding_losses(self, labels: list[dict], device) -> dict:
+        """Huber on object/goal xyz (current end-effector frame, 0.1 m units) and image uv (1/32 units)."""
+        losses = {"grounding_loss": torch.zeros((), device=device, dtype=torch.float32)}
+        prediction = self.waypoint_model.last_grounding
+        if not self.num_object_slots or prediction is None:
+            return losses
+        slots = self.num_object_slots
+        for key, dim, scale, weight in (("xyz", 3, 0.1, self.grounding_xyz_weight), ("uv", 2, 1.0 / 32, self.grounding_uv_weight)):
+            target, valid = self._stack_slot_labels(labels, f"object_{key}", f"object_{key}_valid", (slots, dim), device, torch.float32)
+            if target is None:
+                continue  # e.g. robot data without a grounding sidecar
+            if torch.any(valid):
+                error = (prediction[key][valid] - target[valid]) / scale
+                loss = nn.functional.huber_loss(error, torch.zeros_like(error), delta=1.0)
+                losses[f"grounding_{key}_error"] = (prediction[key][valid] - target[valid]).detach().norm(dim=-1).mean()
+            else:
+                loss = prediction[key].sum() * 0.0
+            losses[f"grounding_{key}_loss"] = loss
+            losses["grounding_loss"] = losses["grounding_loss"] + weight * loss
+        return losses
+
     def _human_geometry_loss(
-        self, examples: list[dict], waypoint_prediction: torch.Tensor, device: torch.device, auxiliary_outputs: dict | None = None
+        self, examples: list[dict], waypoint_prediction: torch.Tensor, device: torch.device, auxiliary_outputs: dict | None = None,
+        waypoint_gripper: torch.Tensor | None = None,
     ) -> dict:
         """Human batches: geometry (+ optional phase/object) supervision; no robot actions, no gripper labels."""
         labels = [example.get("geometry_labels") for example in examples]
@@ -679,13 +755,27 @@ class QwenSpatialOFT(Qwenvl_OFT):
         translation_loss, rotation_loss = relative_pose_loss(waypoint_prediction, target_pose, future_valid)
         waypoint_loss = translation_loss + self.waypoint_rotation_weight * rotation_loss
         slot_losses = self._slot_supervision_losses(labels, auxiliary_outputs or {}, device, "human")
-        total_loss = self.waypoint_weight * waypoint_loss + slot_losses.pop("slot_loss")
+        grounding = self._grounding_losses(labels, device)
+        total_loss = self.waypoint_weight * waypoint_loss + slot_losses.pop("slot_loss") + grounding.pop("grounding_loss")
+        extra = {}
+        if waypoint_gripper is not None and "future_gripper" in labels[0]:
+            # v3: hand closure supervises the same gripper slot head the robot's closure labels do.
+            target, valid = self._stack_slot_labels(
+                labels, "future_gripper", "future_gripper_valid", (len(self.waypoint_tau),), device, torch.float32
+            )
+            gripper_loss = (
+                torch.abs(waypoint_gripper.float() - target)[valid].mean() if torch.any(valid) else waypoint_gripper.float().sum() * 0.0
+            )
+            total_loss = total_loss + self.gripper_weight * gripper_loss
+            extra["gripper_loss"] = gripper_loss
         return {
             "total_loss": total_loss,
             "has_robot_action": False,
             "waypoint_loss": waypoint_loss,
             "waypoint_translation_loss": translation_loss,
             "waypoint_rotation_loss": rotation_loss,
+            **extra,
+            **grounding,
             **slot_losses,
             **self._bridge_metrics(),
         }
